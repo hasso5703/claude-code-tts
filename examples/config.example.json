@@ -1,0 +1,9 @@
+{
+  "mode": "local",
+  "engine": "auto",
+  "voice": "",
+  "rate": null,
+  "barge_in": true,
+  "max_chars": 0,
+  "piper_model": ""
+}

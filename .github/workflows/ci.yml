@@ -1,0 +1,27 @@
+name: ci
+
+on: [push, pull_request]
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m py_compile claude_tts.py
+      - run: python claude_tts.py --version
+      - name: install / hook / uninstall in an isolated HOME
+        run: |
+          export HOME="$GITHUB_WORKSPACE/_home"; mkdir -p "$HOME"
+          python claude_tts.py install --mode spool
+          printf '%s\n' \
+            '{"type":"user","message":{"role":"user","content":"hi"}}' \
+            '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Hello **world** `x`."}]}}' \
+            > "$HOME/t.jsonl"
+          printf '{"session_id":"ci","transcript_path":"%s","hook_event_name":"Stop"}' "$HOME/t.jsonl" | python claude_tts.py hook
+          test -s "$HOME/.claude/tts/spool.ndjson" && echo "spool written OK"
+          grep -q '"text": "Hello world x."' "$HOME/.claude/tts/spool.ndjson"
+          python claude_tts.py doctor
+          python claude_tts.py uninstall --purge
