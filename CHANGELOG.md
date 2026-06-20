@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.1
+
+- Fix off-by-one: the `Stop` hook could speak the previous turn's text when the
+  transcript's closing assistant message hadn't been flushed yet (common when
+  the turn ended on a tool call). The hook now waits for the final assistant
+  text to land before speaking.
+
 ## 1.0.0
 
 - Initial release.

@@ -32,7 +32,7 @@ import subprocess
 import sys
 import time
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 
 HOME = os.path.expanduser("~")
 CLAUDE_DIR = os.path.join(HOME, ".claude")
@@ -136,16 +136,7 @@ def _assistant_text(o):
     return "\n\n".join(out)
 
 
-def final_answer_text(path):
-    """The text to speak.
-
-    Default: the final run of assistant text (walk back from the end, stop at the
-    first 'user' line). On a real Stop event the turn ends with text, so this is
-    the conclusion - not the inter-tool "let me check..." chatter.
-
-    Fallback (turn ended on a tool call, no closing text): just the most recent
-    assistant text block - bounded, never the whole turn.
-    """
+def _load_objs(path):
     objs = []
     with open(path, encoding="utf-8") as f:
         for ln in f:
@@ -156,7 +147,13 @@ def final_answer_text(path):
                 objs.append(json.loads(ln))
             except Exception:
                 pass
+    return objs
 
+
+def _trail_text(objs):
+    """The run of assistant text at the very end (walk back, stop at first
+    'user' line). Empty when the transcript currently ends on a tool call /
+    tool_result - i.e. the turn's closing assistant text isn't written yet."""
     trail = []
     for o in reversed(objs):
         t = o.get("type")
@@ -166,15 +163,45 @@ def final_answer_text(path):
             tx = _assistant_text(o)
             if tx.strip():
                 trail.insert(0, tx)
-    if trail:
-        return "\n\n".join(trail).strip()
+    return "\n\n".join(trail).strip()
 
+
+def final_answer_text(path):
+    """The text to speak: the final run of assistant text. On a real Stop the
+    turn ends with text, so this is the conclusion - not the inter-tool "let me
+    check..." chatter. Fallback (no closing text): the most recent assistant
+    text block - bounded, never the whole turn."""
+    objs = _load_objs(path)
+    trail = _trail_text(objs)
+    if trail:
+        return trail
     for o in reversed(objs):
         if o.get("type") == "assistant":
             tx = _assistant_text(o)
             if tx.strip():
                 return tx.strip()
     return ""
+
+
+def final_answer_text_settled(path, timeout=3.0, interval=0.12):
+    """Wait briefly for the turn's closing assistant text to land in the JSONL.
+
+    Claude Code can fire the Stop hook a hair before the final assistant
+    message is flushed to the transcript - especially when the turn ended on a
+    tool call, so the last line is a tool_result ('user') line. Reading then
+    would speak the PREVIOUS turn's text (off-by-one). Poll until assistant
+    text appears after the last user line, or give up and best-effort."""
+    deadline = time.time() + timeout
+    while True:
+        try:
+            trail = _trail_text(_load_objs(path))
+        except Exception:
+            trail = ""
+        if trail:
+            return trail
+        if time.time() >= deadline:
+            return final_answer_text(path)
+        time.sleep(interval)
 
 
 # --------------------------------------------------------------------------- #
@@ -471,7 +498,7 @@ def cmd_hook(_args):
     if not tpath or not os.path.exists(tpath):
         return 0
     try:
-        raw = final_answer_text(tpath)
+        raw = final_answer_text_settled(tpath)
     except Exception:
         return 0
     if not raw.strip():
