@@ -32,7 +32,7 @@ import subprocess
 import sys
 import time
 
-VERSION = "1.0.1"
+VERSION = "1.2.0"
 
 HOME = os.path.expanduser("~")
 CLAUDE_DIR = os.path.join(HOME, ".claude")
@@ -45,8 +45,18 @@ LAST_RAW = os.path.join(TTS_DIR, "last.raw.txt")
 LAST_JSON = os.path.join(TTS_DIR, "last.json")
 HASH_FILE = os.path.join(TTS_DIR, ".last.hash")
 PID_FILE = os.path.join(TTS_DIR, ".speaking.pid")
+QUEUE_DIR = os.path.join(TTS_DIR, "queue")   # per-session audio queues (stream mode)
+DEBUG_FLAG = os.path.join(TTS_DIR, "DEBUG")  # touch this file to log hook activity
+HOOK_LOG = os.path.join(TTS_DIR, "hook.log")
+DAEMON_IDLE = 1800   # stream daemon exits after this many idle seconds
 INSTALLED_SELF = os.path.join(TTS_DIR, "claude_tts.py")
 HOOK_MARKER = "claude_tts.py"          # identifies our hook inside settings.json
+# Events we wire. Stream mode runs a transcript-tailing daemon: UserPromptSubmit
+# starts it (and hushes the prior turn), PreToolUse keeps it alive, SessionEnd
+# stops it. Single mode just speaks the final answer at Stop.
+STREAM_EVENTS = ["PreToolUse", "UserPromptSubmit", "SessionEnd"]
+SINGLE_EVENTS = ["Stop"]
+ALL_EVENTS = ["PreToolUse", "PostToolUse", "Stop", "UserPromptSubmit", "SessionEnd"]
 REMOTE_SPOOL_DEFAULT = "~/.claude/tts/spool.ndjson"
 SPOOL_MAX_BYTES = 5 * 1024 * 1024
 
@@ -58,6 +68,8 @@ DEFAULT_CONFIG = {
     "voice": "",          # engine-specific voice name; "" = engine default
     "rate": None,         # engine-specific speed; None = engine default
     "barge_in": True,     # a new response interrupts speech in progress
+    "stream": True,       # speak each block live at tool boundaries, vs one shot
+                          #   at end of turn. Block-level (no token streaming).
     "max_chars": 0,       # truncate spoken text to N chars (0 = no limit)
     "piper_model": "",    # path to a piper .onnx voice (engine=piper)
 }
@@ -324,16 +336,16 @@ def _raw_player():
     return None
 
 
-def _write_pid(pid):
+def _write_pid(pid, path=PID_FILE):
     try:
-        _atomic_write(PID_FILE, str(pid))
+        _atomic_write(path, str(pid))
     except Exception:
         pass
 
 
-def _kill_prev():
+def _kill_prev(path=PID_FILE):
     try:
-        pid = int(open(PID_FILE, encoding="utf-8").read().strip())
+        pid = int(open(path, encoding="utf-8").read().strip())
     except Exception:
         return
     try:
@@ -352,8 +364,12 @@ def _popen_kwargs():
     return kw
 
 
-def speak(cfg, text):
-    """Speak `text` synchronously (blocks until done)."""
+def speak(cfg, text, pidfile=PID_FILE, barge=None):
+    """Speak `text` synchronously (blocks until done).
+
+    `pidfile` records the player PID so it can be interrupted later. `barge`
+    overrides the configured barge-in: the sequential queue passes barge=False
+    so chained blocks play in full instead of cutting each other off."""
     text = (text or "").strip()
     if not text:
         return
@@ -364,8 +380,8 @@ def speak(cfg, text):
         sys.stderr.write("[claude-tts] no TTS engine found "
                          "(install macOS say, or espeak-ng / spd-say on Linux)\n")
         return
-    if cfg.get("barge_in", True):
-        _kill_prev()
+    if (cfg.get("barge_in", True) if barge is None else barge):
+        _kill_prev(pidfile)
     voice = cfg.get("voice") or ""
     rate = cfg.get("rate")
 
@@ -378,7 +394,7 @@ def speak(cfg, text):
                 argv += ["-r", str(rate)]
             argv += ["--", text]
             p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, **_popen_kwargs())
-            _write_pid(p.pid)
+            _write_pid(p.pid, pidfile)
             p.wait()
 
         elif engine == "espeak-ng":
@@ -387,7 +403,7 @@ def speak(cfg, text):
                 argv += ["-s", str(rate)]
             argv += ["--stdin"]
             p = subprocess.Popen(argv, stdin=subprocess.PIPE, **_popen_kwargs())
-            _write_pid(p.pid)
+            _write_pid(p.pid, pidfile)
             p.communicate(text.encode("utf-8"))
 
         elif engine == "spd-say":
@@ -398,13 +414,13 @@ def speak(cfg, text):
                 argv += ["-r", str(rate)]
             argv += ["--", text]
             p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, **_popen_kwargs())
-            _write_pid(p.pid)
+            _write_pid(p.pid, pidfile)
             p.wait()
 
         elif engine == "festival":
             p = subprocess.Popen(["festival", "--tts"], stdin=subprocess.PIPE,
                                  **_popen_kwargs())
-            _write_pid(p.pid)
+            _write_pid(p.pid, pidfile)
             p.communicate(text.encode("utf-8"))
 
         elif engine == "piper":
@@ -421,7 +437,7 @@ def speak(cfg, text):
             p2 = subprocess.Popen(player, stdin=p1.stdout,
                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             p1.stdout.close()
-            _write_pid(p1.pid)
+            _write_pid(p1.pid, pidfile)
             try:
                 p1.stdin.write(text.encode("utf-8"))
                 p1.stdin.close()
@@ -487,6 +503,335 @@ def tail_lines(path):
 
 
 # --------------------------------------------------------------------------- #
+# Streaming: speak each block live, at tool boundaries                          #
+# --------------------------------------------------------------------------- #
+def _sid(session):
+    s = "".join(c if (c.isalnum() or c in "-_") else "_" for c in (session or "default"))
+    return s or "default"
+
+
+def _qfile(s):   return os.path.join(QUEUE_DIR, _sid(s) + ".q")
+def _qlock(s):   return os.path.join(QUEUE_DIR, _sid(s) + ".lock")
+def _qpid(s):    return os.path.join(QUEUE_DIR, _sid(s) + ".pid")
+def _dpid(s):    return os.path.join(QUEUE_DIR, _sid(s) + ".daemon.pid")
+def _dlock(s):   return os.path.join(QUEUE_DIR, _sid(s) + ".daemon.lock")
+
+
+def _qdir():
+    try:
+        os.makedirs(QUEUE_DIR, exist_ok=True)
+    except Exception:
+        pass
+
+
+def _dbg(msg):
+    """Append a diagnostic line to hook.log, but only when ~/.claude/tts/DEBUG
+    exists. Off by default - zero overhead and silent for normal use."""
+    try:
+        if not os.path.exists(DEBUG_FLAG):
+            return
+        with open(HOOK_LOG, "a", encoding="utf-8") as f:
+            f.write(msg + "\n")
+    except Exception:
+        pass
+
+
+def _flock_ex(f, blocking=True):
+    """Best-effort exclusive flock; True on success, False if held (non-blocking)
+    or unsupported (e.g. no fcntl)."""
+    try:
+        import fcntl
+        flags = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+        fcntl.flock(f.fileno(), flags)
+        return True
+    except Exception:
+        return False
+
+
+def _q_append(s, text):
+    _qdir()
+    try:
+        with open(_qfile(s), "a", encoding="utf-8") as f:
+            _flock_ex(f)
+            f.write(json.dumps({"text": text}, ensure_ascii=False) + "\n")
+            f.flush()
+    except Exception:
+        pass
+
+
+def _q_pop(s):
+    """Remove and return the first queued text (FIFO), atomically."""
+    try:
+        f = open(_qfile(s), "r+", encoding="utf-8")
+    except Exception:
+        return ""
+    try:
+        _flock_ex(f)
+        lines = f.readlines()
+        if not lines:
+            return ""
+        first, rest = lines[0], lines[1:]
+        f.seek(0)
+        f.truncate()
+        f.writelines(rest)
+        f.flush()
+    finally:
+        try:
+            f.close()
+        except Exception:
+            pass
+    try:
+        return json.loads(first).get("text", "")
+    except Exception:
+        return ""
+
+
+def _q_clear(s):
+    try:
+        f = open(_qfile(s), "r+", encoding="utf-8")
+    except Exception:
+        return
+    try:
+        _flock_ex(f)
+        f.seek(0)
+        f.truncate()
+    finally:
+        try:
+            f.close()
+        except Exception:
+            pass
+
+
+def _drain(session):
+    """Speak a session's queued blocks one after another (no overlap). Only one
+    drainer runs per session: a second exits immediately and lets this one pick
+    up whatever it just enqueued."""
+    cfg = load_config()
+    _qdir()
+    try:
+        lf = open(_qlock(session), "w")
+    except Exception:
+        lf = None
+    if lf is not None and not _flock_ex(lf, blocking=False):
+        return  # another drainer already owns this session
+    try:
+        while True:
+            text = _q_pop(session)
+            if not text:
+                time.sleep(0.05)            # grace for a just-appended block
+                text = _q_pop(session)
+                if not text:
+                    break
+            speak(cfg, text, pidfile=_qpid(session), barge=False)
+    finally:
+        if lf is not None:
+            try:
+                lf.close()
+            except Exception:
+                pass
+
+
+def _spawn_drainer(session):
+    py = sys.executable or "python3"
+    selfpath = os.path.abspath(__file__)
+    try:
+        subprocess.Popen([py, selfpath, "drain", session],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL,
+                         start_new_session=(os.name == "posix"))
+    except Exception:
+        pass
+
+
+# --------------------------------------------------------------------------- #
+# Stream daemon: tail the transcript, speak each block the instant it lands     #
+# --------------------------------------------------------------------------- #
+def _proc_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
+
+def _daemon_running(session):
+    try:
+        return _proc_alive(int(open(_dpid(session), encoding="utf-8").read().strip()))
+    except Exception:
+        return False
+
+
+def _start_daemon(session, transcript):
+    """Ensure a transcript-tailing speak daemon is running for this session."""
+    if not transcript or not session or _daemon_running(session):
+        return
+    py = sys.executable or "python3"
+    selfpath = os.path.abspath(__file__)
+    try:
+        subprocess.Popen([py, selfpath, "daemon", session, transcript],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL,
+                         start_new_session=(os.name == "posix"))
+    except Exception:
+        pass
+
+
+def _signal_daemon(session, sig):
+    try:
+        os.kill(int(open(_dpid(session), encoding="utf-8").read().strip()), sig)
+    except Exception:
+        pass
+
+
+def _daemon_hush(session):
+    """New turn / barge-in: drop pending speech and cut off the current block."""
+    _q_clear(session)
+    _kill_prev(_qpid(session))
+    _signal_daemon(session, signal.SIGUSR1)
+
+
+def _stop_daemon(session):
+    _signal_daemon(session, signal.SIGTERM)
+
+
+def _turn_start_lineno(transcript):
+    """Raw line count up to and including the last real user prompt - where the
+    current turn begins. The daemon skips this many lines on start so it never
+    replays earlier turns, only speaks what comes next."""
+    start = 0
+    try:
+        with open(transcript, encoding="utf-8", errors="replace") as f:
+            for i, ln in enumerate(f):
+                s = ln.strip()
+                if not s:
+                    continue
+                try:
+                    o = json.loads(s)
+                except Exception:
+                    continue
+                if _is_human_user(o):
+                    start = i + 1
+    except Exception:
+        return 0
+    return start
+
+
+def _daemon_handle(session, line, spoken):
+    s = line.strip()
+    if not s:
+        return
+    try:
+        o = json.loads(s)
+    except Exception:
+        return
+    if _is_human_user(o):
+        # A new turn began -> hush and forget (new blocks carry new ids anyway).
+        spoken.clear()
+        _q_clear(session)
+        _kill_prev(_qpid(session))
+        return
+    if o.get("type") != "assistant":
+        return
+    raw = _assistant_text(o)
+    if not raw.strip():
+        return
+    clean = clean_for_tts(raw)
+    if not clean:
+        return
+    key = o.get("uuid") or hashlib.sha1(clean.encode("utf-8")).hexdigest()
+    if key in spoken:
+        return
+    spoken.add(key)
+    rec = {"ts": time.time(), "session": session, "cwd": "",
+           "chars": len(clean), "text": clean, "raw": raw}
+    write_outputs(rec, hashlib.sha1(clean.encode("utf-8")).hexdigest())
+    if load_config().get("mode", "local") == "local":
+        _q_append(session, clean)
+        _spawn_drainer(session)
+
+
+def _daemon(session, transcript, from_end=False):
+    """Tail the session transcript and speak each assistant text block the moment
+    its line lands - decoupled from tool boundaries, so no off-by-one and no wait
+    for the next tool. Speaking itself runs in the sequential drainer; this
+    process only watches and enqueues. `from_end` starts at EOF (for a manual
+    mid-turn start), otherwise it begins at the current turn's first line."""
+    _qdir()
+    try:
+        lf = open(_dlock(session), "w")
+        import fcntl
+        fcntl.flock(lf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except Exception:
+        return  # another daemon already owns this session (or no fcntl)
+    try:
+        _atomic_write(_dpid(session), str(os.getpid()))
+    except Exception:
+        pass
+
+    def _on_hush(*_a):
+        _q_clear(session)
+        _kill_prev(_qpid(session))
+    try:
+        signal.signal(signal.SIGUSR1, _on_hush)
+    except Exception:
+        pass
+
+    spoken = set()
+    while not os.path.exists(transcript):
+        time.sleep(0.3)
+    try:
+        f = open(transcript, "r", encoding="utf-8", errors="replace")
+    except Exception:
+        return
+    if from_end:
+        try:
+            f.seek(0, os.SEEK_END)
+        except Exception:
+            pass
+    else:
+        for _ in range(_turn_start_lineno(transcript)):
+            if not f.readline():
+                break
+    try:
+        inode = os.fstat(f.fileno()).st_ino
+    except Exception:
+        inode = None
+    last = time.time()
+    buf = ""
+    try:
+        while True:
+            line = f.readline()
+            if line:
+                last = time.time()
+                buf += line
+                if buf.endswith("\n"):
+                    _daemon_handle(session, buf, spoken)
+                    buf = ""
+                continue
+            if time.time() - last > DAEMON_IDLE:
+                break
+            time.sleep(0.15)
+            try:
+                st = os.stat(transcript)
+                if inode is not None and (st.st_ino != inode or st.st_size < f.tell()):
+                    f.close()
+                    f = open(transcript, "r", encoding="utf-8", errors="replace")
+                    inode = os.fstat(f.fileno()).st_ino
+                    buf = ""
+            except FileNotFoundError:
+                break
+    finally:
+        try:
+            f.close()
+        except Exception:
+            pass
+        try:
+            os.remove(_dpid(session))
+        except Exception:
+            pass
+
+
+# --------------------------------------------------------------------------- #
 # Commands                                                                      #
 # --------------------------------------------------------------------------- #
 def cmd_hook(_args):
@@ -494,7 +839,30 @@ def cmd_hook(_args):
         data = json.load(sys.stdin)
     except Exception:
         return 0
+    cfg = load_config()
+    event = data.get("hook_event_name") or "Stop"
+    session = data.get("session_id")
     tpath = data.get("transcript_path")
+    _dbg("%.2f %-16s sess=%s" % (time.time(), event, _sid(session)[:8]))
+
+    # Streaming OFF -> original behaviour: one shot, final answer only, at Stop.
+    if not cfg.get("stream", True):
+        return _hook_single_shot(data, cfg, tpath) if event == "Stop" else 0
+
+    # Streaming ON -> a background daemon tails the transcript and speaks each
+    # block the instant it lands. The hooks only manage that daemon's lifecycle.
+    if event == "SessionEnd":
+        _stop_daemon(session)
+    elif event == "UserPromptSubmit":
+        _daemon_hush(session)            # cut the previous turn's speech at once
+        _start_daemon(session, tpath)    # ensure the daemon is up for this turn
+    elif event == "PreToolUse":
+        _start_daemon(session, tpath)    # cheap keep-alive: restart if it died
+    return 0
+
+
+def _hook_single_shot(data, cfg, tpath):
+    """Original behaviour: speak only the final answer, once, at end of turn."""
     if not tpath or not os.path.exists(tpath):
         return 0
     try:
@@ -506,25 +874,15 @@ def cmd_hook(_args):
     clean = clean_for_tts(raw)
     if not clean:
         return 0
-
     h = hashlib.sha1(clean.encode("utf-8")).hexdigest()
     try:
         if os.path.exists(HASH_FILE) and open(HASH_FILE, encoding="utf-8").read().strip() == h:
             return 0
     except Exception:
         pass
-
-    rec = {
-        "ts": time.time(),
-        "session": data.get("session_id"),
-        "cwd": data.get("cwd"),
-        "chars": len(clean),
-        "text": clean,
-        "raw": raw,
-    }
+    rec = {"ts": time.time(), "session": data.get("session_id"),
+           "cwd": data.get("cwd"), "chars": len(clean), "text": clean, "raw": raw}
     write_outputs(rec, h)
-
-    cfg = load_config()
     if cfg.get("mode", "local") == "local":
         _spawn_speak_detached()
     return 0
@@ -542,6 +900,16 @@ def _spawn_speak_detached():
         )
     except Exception:
         pass
+
+
+def cmd_drain(args):
+    _drain(args.session)
+    return 0
+
+
+def cmd_daemon(args):
+    _daemon(args.session, args.transcript, getattr(args, "from_end", False))
+    return 0
 
 
 def cmd_speak_file(args):
@@ -639,6 +1007,8 @@ def cmd_install(args):
         cfg["rate"] = args.rate
     if args.piper_model:
         cfg["piper_model"] = args.piper_model
+    if getattr(args, "stream", None) is not None:
+        cfg["stream"] = args.stream
     save_config(cfg)
 
     import shlex
@@ -652,9 +1022,18 @@ def cmd_install(args):
         except Exception:
             pass
     hooks = settings.setdefault("hooks", {})
-    stop = [e for e in hooks.get("Stop", []) if not _entry_is_ours(e)]
-    stop.append({"hooks": [{"type": "command", "command": hook_cmd}]})
-    hooks["Stop"] = stop
+    events = STREAM_EVENTS if cfg.get("stream", True) else SINGLE_EVENTS
+    for ev in ALL_EVENTS:
+        kept = [e for e in hooks.get(ev, []) if not _entry_is_ours(e)]
+        if ev in events:
+            entry = {"hooks": [{"type": "command", "command": hook_cmd}]}
+            if ev in ("PreToolUse", "PostToolUse"):
+                entry["matcher"] = "*"
+            kept.append(entry)
+        if kept:
+            hooks[ev] = kept
+        elif ev in hooks:
+            del hooks[ev]
     os.makedirs(os.path.dirname(SETTINGS), exist_ok=True)
     with open(SETTINGS, "w", encoding="utf-8") as f:
         json.dump(settings, f, indent=2)
@@ -664,23 +1043,27 @@ def cmd_install(args):
     print("  hook    :", hook_cmd)
     print("  config  :", CONFIG_PATH)
     print("  mode    :", cfg["mode"])
+    print("  stream  :", cfg.get("stream", True),
+          "(speak each block live)" if cfg.get("stream", True) else "(one shot at end)")
+    print("  events  :", ", ".join(events))
     print("  engine  :", detect_engine(cfg) or "NONE - install say/espeak-ng/spd-say")
     if cfg["mode"] == "local":
         print("\nLocal mode: responses will be spoken on THIS machine.")
     else:
         print("\nSpool mode: this machine only records responses. On your audio "
               "machine run:\n  claude-tts listen --ssh <this-host>")
-    print("\n>>> Restart Claude Code (or run /hooks) to activate the hook. <<<")
+    print("\n>>> Restart Claude Code (or run /hooks) to activate the hooks. <<<")
     return 0
 
 
 def cmd_uninstall(args):
     settings = _read_settings()
     hooks = settings.get("hooks", {})
-    if "Stop" in hooks:
-        hooks["Stop"] = [e for e in hooks["Stop"] if not _entry_is_ours(e)]
-        if not hooks["Stop"]:
-            del hooks["Stop"]
+    for ev in ALL_EVENTS:
+        if ev in hooks:
+            hooks[ev] = [e for e in hooks[ev] if not _entry_is_ours(e)]
+            if not hooks[ev]:
+                del hooks[ev]
     if not hooks:
         settings.pop("hooks", None)
     with open(SETTINGS, "w", encoding="utf-8") as f:
@@ -694,6 +1077,10 @@ def cmd_uninstall(args):
                 os.remove(p)
             except Exception:
                 pass
+        try:
+            shutil.rmtree(QUEUE_DIR)
+        except Exception:
+            pass
         print("purged", TTS_DIR, "files")
     print("Restart Claude Code to fully deactivate.")
     return 0
@@ -713,12 +1100,35 @@ def cmd_doctor(_args):
     print("  voice     :", cfg["voice"] or "(default)")
     print("  rate      :", cfg["rate"])
     print("  barge_in  :", cfg["barge_in"])
+    print("  stream    :", cfg.get("stream", True))
     settings = _read_settings()
-    stop = settings.get("hooks", {}).get("Stop", [])
-    ours = [e for e in stop if _entry_is_ours(e)]
-    print("hook wired  :", "YES" if ours else "NO", "(in", SETTINGS + ")")
-    if ours:
-        print("  command   :", ours[0]["hooks"][0]["command"])
+    allhooks = settings.get("hooks", {})
+    wired = [ev for ev in ALL_EVENTS
+             if any(_entry_is_ours(e) for e in allhooks.get(ev, []))]
+    print("hooks wired :", ", ".join(wired) or "NONE", "(in", SETTINGS + ")")
+    cmd_seen = ""
+    for ev in wired:
+        for e in allhooks.get(ev, []):
+            if _entry_is_ours(e):
+                cmd_seen = e["hooks"][0]["command"]
+                break
+        if cmd_seen:
+            break
+    if cmd_seen:
+        print("  command   :", cmd_seen)
+    daemons = []
+    try:
+        for fn in sorted(os.listdir(QUEUE_DIR)):
+            if fn.endswith(".daemon.pid"):
+                try:
+                    if _proc_alive(int(open(os.path.join(QUEUE_DIR, fn),
+                                            encoding="utf-8").read().strip())):
+                        daemons.append(fn.split(".")[0][:8])
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    print("daemon(s)   :", ", ".join(daemons) or "none running")
     print("spool       :", SPOOL,
           "(%d lines)" % sum(1 for _ in open(SPOOL, encoding="utf-8"))
           if os.path.exists(SPOOL) else "(none yet)")
@@ -737,20 +1147,35 @@ def build_parser():
     p.add_argument("--version", action="version", version="claude-code-tts " + VERSION)
     sub = p.add_subparsers(dest="cmd")
 
-    pi = sub.add_parser("install", help="wire the Stop hook into settings.json")
+    pi = sub.add_parser("install", help="wire the TTS hooks into settings.json")
     pi.add_argument("--mode", choices=["local", "spool"])
     pi.add_argument("--engine")
     pi.add_argument("--voice")
     pi.add_argument("--rate", type=int)
     pi.add_argument("--piper-model", dest="piper_model")
+    pi.add_argument("--stream", dest="stream", action="store_true", default=None,
+                    help="speak each block live at tool boundaries (default)")
+    pi.add_argument("--no-stream", dest="stream", action="store_false",
+                    help="speak only the final answer, once at end of turn")
     pi.set_defaults(func=cmd_install)
 
     pu = sub.add_parser("uninstall", help="remove the hook")
     pu.add_argument("--purge", action="store_true", help="also delete config/spool")
     pu.set_defaults(func=cmd_uninstall)
 
-    ph = sub.add_parser("hook", help="(internal) Claude Code Stop hook")
+    ph = sub.add_parser("hook", help="(internal) Claude Code hook (all events)")
     ph.set_defaults(func=cmd_hook)
+
+    pdr = sub.add_parser("drain", help="(internal) speak a session's queued blocks")
+    pdr.add_argument("session")
+    pdr.set_defaults(func=cmd_drain)
+
+    pdm = sub.add_parser("daemon", help="(internal) tail a transcript and speak live")
+    pdm.add_argument("session")
+    pdm.add_argument("transcript")
+    pdm.add_argument("--from-end", dest="from_end", action="store_true",
+                     help="start at end of transcript (skip the current backlog)")
+    pdm.set_defaults(func=cmd_daemon)
 
     pl = sub.add_parser("listen", help="speak responses from a spool")
     pl.add_argument("--ssh", metavar="HOST", help="tail the spool on a remote host")
@@ -781,8 +1206,8 @@ def main(argv=None):
     except KeyboardInterrupt:
         return 0
     except Exception as e:
-        # the hook must never disturb Claude Code
-        if getattr(args, "cmd", None) == "hook":
+        # the hook (and its detached drainer) must never disturb Claude Code
+        if getattr(args, "cmd", None) in ("hook", "drain", "daemon"):
             return 0
         sys.stderr.write("[claude-tts] %s\n" % e)
         return 1
