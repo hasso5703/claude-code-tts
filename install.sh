@@ -4,10 +4,11 @@
 # Usage (from a clone):
 #   ./install.sh [--mode local|spool] [--voice NAME] [--rate N] [--engine E]
 #
-# Neural French/English voice (macOS Apple Silicon) — creates a venv, installs
-# mlx-audio, downloads the model, wires hooks:
-#   ./install.sh --engine voxtral
-#   # or the friendly alias:  python3 claude_tts.py setup-voxtral
+# Neural French voice (macOS Apple Silicon) — one command: creates a venv,
+# installs mlx-audio, downloads the model, wires hooks:
+#   python3 claude_tts.py setup-kokoro    # fast, Apache-2.0 (recommended)
+#   python3 claude_tts.py setup-voxtral   # top quality, non-commercial
+# Switch anytime:  python3 claude_tts.py preset kokoro|voxtral
 #
 # Usage (one-liner):
 #   CCTTS_RAW_URL="https://raw.githubusercontent.com/hasso5703/claude-code-tts/main/claude_tts.py" \
