@@ -32,7 +32,7 @@ import subprocess
 import sys
 import time
 
-VERSION = "1.3.2"
+VERSION = "1.4.0"
 
 HOME = os.path.expanduser("~")
 CLAUDE_DIR = os.path.join(HOME, ".claude")
@@ -50,6 +50,13 @@ DEBUG_FLAG = os.path.join(TTS_DIR, "DEBUG")  # touch this file to log hook activ
 HOOK_LOG = os.path.join(TTS_DIR, "hook.log")
 DAEMON_IDLE = 1800   # stream daemon exits after this many idle seconds
 DEFAULT_VOXTRAL_MODEL = "mlx-community/Voxtral-4B-TTS-2603-mlx-4bit"
+# Switchable voice presets (model + voice + language), used by `preset`.
+TTS_PRESETS = {
+    "voxtral": {"voxtral_model": "mlx-community/Voxtral-4B-TTS-2603-mlx-4bit",
+                "voice": "fr_female", "lang_code": ""},   # native FR, top quality, CC-BY-NC
+    "kokoro":  {"voxtral_model": "mlx-community/Kokoro-82M-bf16",
+                "voice": "ff_siwis", "lang_code": "f"},    # native FR, fast/light, Apache-2.0
+}
 DEFAULT_VOXTRAL_PORT = 8765
 SERVER_IDLE = 1800   # Voxtral server exits after this many idle seconds
 VENV_PY = os.path.join(TTS_DIR, "venv", "bin", "python")  # venv with mlx-audio
@@ -78,7 +85,8 @@ DEFAULT_CONFIG = {
     "max_chars": 0,       # truncate spoken text to N chars (0 = no limit)
     "piper_model": "",    # path to a piper .onnx voice (engine=piper)
     # --- engine=voxtral: neural TTS (Mistral) via a persistent mlx-audio server ---
-    "speed": 1.0,         # playback speed hint (Voxtral currently ignores it)
+    "speed": 1.0,         # playback speed (Kokoro applies it; Voxtral ignores)
+    "lang_code": "",      # language for engines that need it (Kokoro: "f"=FR); "" = none
     "say_voice": "",      # macOS `say` voice used as fallback if the server is down
     "voxtral_model": DEFAULT_VOXTRAL_MODEL,
     "voxtral_port": DEFAULT_VOXTRAL_PORT,
@@ -1018,10 +1026,11 @@ def _bootstrap_voxtral():
         if r.returncode != 0 or not os.path.exists(py):
             return False, "could not create venv (need `python3 -m venv`)"
     if not _venv_has_deps(py):
-        print("  installing mlx-audio + mistral-common[audio] (a few minutes)...")
+        print("  installing mlx-audio + voice deps (a few minutes)...")
         subprocess.run([py, "-m", "pip", "install", "-q", "--upgrade", "pip"])
         r = subprocess.run([py, "-m", "pip", "install", "-q",
-                            "mlx-audio", "mistral-common[audio]"])
+                            "mlx-audio", "mistral-common[audio]",  # Voxtral
+                            "misaki[en]", "phonemizer-fork", "espeakng-loader"])  # Kokoro
         if r.returncode != 0 or not _venv_has_deps(py):
             return False, "pip install of mlx-audio failed"
     return True, "ok"
@@ -1060,6 +1069,7 @@ def _voxtral_synth(cfg, text):
         return None   # no venv -> the server can never come up; don't stall
     url = "http://127.0.0.1:%d/speak" % _server_port(cfg)
     body = json.dumps({"text": text, "voice": cfg.get("voice") or "fr_female",
+                       "lang_code": cfg.get("lang_code") or "",
                        "speed": cfg.get("speed") or 1.0}).encode("utf-8")
     deadline = time.time() + 25.0    # model-load window
     wav = None
@@ -1243,11 +1253,16 @@ def _tts_server(port):
         sr0 = int(getattr(model, "sample_rate", 24000) or 24000)
         state["ready"] = True
         while True:
-            text, voice, out = jobs.get()
+            text, voice, lang, speed, out = jobs.get()
             try:
                 chunks, sr = [], sr0
-                mt = int(min(900, max(200, len(text) * 4)))
-                for res in model.generate(text=text, voice=voice, max_tokens=mt):
+                # Both Voxtral and Kokoro take **kwargs: Voxtral uses max_tokens
+                # (ignores lang_code), Kokoro uses lang_code (ignores max_tokens).
+                gkw = {"text": text, "voice": voice, "speed": speed,
+                       "max_tokens": int(min(900, max(200, len(text) * 4)))}
+                if lang:
+                    gkw["lang_code"] = lang
+                for res in model.generate(**gkw):
                     a = np.asarray(res.audio, dtype=np.float32).reshape(-1)
                     if a.size:
                         chunks.append(a)
@@ -1290,8 +1305,13 @@ def _tts_server(port):
                 req = {}
             text = (req.get("text") or "").strip()
             voice = req.get("voice") or cfg.get("voice") or "fr_female"
+            lang = req.get("lang_code") or cfg.get("lang_code") or ""
+            try:
+                speed = float(req.get("speed") or cfg.get("speed") or 1.0)
+            except Exception:
+                speed = 1.0
             out = {"event": threading.Event()}
-            jobs.put((text, voice, out))
+            jobs.put((text, voice, lang, speed, out))
             if not out["event"].wait(timeout=120) or "wav" not in out:
                 sys.stderr.write("[claude-tts] synth error: %s\n"
                                  % out.get("err", "timeout"))
@@ -1422,6 +1442,30 @@ def cmd_daemon(args):
 
 def cmd_tts_server(args):
     _tts_server(args.port)
+    return 0
+
+
+def cmd_preset(args):
+    """Switch the neural voice (model + voice + language) and reload the server.
+    Both presets stay available - flip back any time."""
+    p = TTS_PRESETS.get(args.name)
+    if not p:
+        print("unknown preset '%s'. Choose: %s" % (args.name, ", ".join(TTS_PRESETS)))
+        return 1
+    cfg = load_config()
+    cfg["engine"] = "voxtral"   # the local mlx-audio server engine (both presets use it)
+    cfg.update(p)
+    save_config(cfg)
+    _stop_server()
+    for _ in range(20):
+        if not _port_open(_server_port(cfg)):
+            break
+        time.sleep(0.3)
+    _download_voxtral_model(cfg)
+    _start_server(cfg)
+    print("voice preset -> %s  (model=%s, voice=%s, lang=%s)"
+          % (args.name, p["voxtral_model"], p["voice"], p["lang_code"] or "auto"))
+    print("server is reloading the model; the first block may wait ~10-15s.")
     return 0
 
 
@@ -1730,6 +1774,10 @@ def build_parser():
                           help="enable Voxtral neural TTS (venv + model + hooks)")
     pset.add_argument("--voice", default=None)
     pset.set_defaults(func=cmd_setup_voxtral)
+
+    ppr = sub.add_parser("preset", help="switch neural voice: voxtral | kokoro")
+    ppr.add_argument("name", choices=sorted(TTS_PRESETS))
+    ppr.set_defaults(func=cmd_preset)
 
     pl = sub.add_parser("listen", help="speak responses from a spool")
     pl.add_argument("--ssh", metavar="HOST", help="tail the spool on a remote host")

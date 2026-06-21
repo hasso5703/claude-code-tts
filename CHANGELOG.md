@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.4.0
+
+- Switchable voice presets via `preset voxtral|kokoro` (one command, reloads the
+  model): **voxtral** = native French, top quality, CC-BY-NC; **kokoro** =
+  native French (`ff_siwis`), tiny/fast (RTF ~0.5x, no thermal throttle on a
+  fanless Mac), Apache-2.0 (commercial-friendly). Both stay installed.
+- The model server now passes `lang_code` (Kokoro needs it for the language) and
+  `speed` through to the model; both Voxtral and Kokoro take `**kwargs`, so each
+  ignores what it doesn't use. New `lang_code` config key.
+- Bootstrap also installs Kokoro's text deps (`misaki[en]`, `phonemizer-fork`,
+  `espeakng-loader`; `espeakng-loader` bundles espeak-ng, so no system install).
+
 ## 1.3.2
 
 - A daemon that died and was restarted mid-turn by the keep-alive used to replay

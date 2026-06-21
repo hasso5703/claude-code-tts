@@ -50,7 +50,14 @@ Then **restart Claude Code** (hooks load at startup) — or open `/hooks` inside
 
 **Voices** (set `voice` in the config): French `fr_female` / `fr_male`; generic/English `casual_female`, `casual_male`, `neutral_female`, `neutral_male`, `cheerful_female`; and per-language `de_*`, `es_*`, `it_*`, `pt_*`, `nl_*`, `ar_male`, `hi_*`. Voxtral is multilingual — the voice carries the timbre/accent, the text carries the language.
 
-**License caveat.** Voxtral weights are **CC‑BY‑NC‑4.0 (non-commercial)**. Fine for personal use; not for a commercial product. For a permissive (Apache‑2.0) alternative, point `voxtral_model` at a Qwen3‑TTS MLX model instead — the server is model-agnostic (it uses mlx-audio's generic loader).
+**Two voices, one command.** `setup-voxtral` installs both; flip any time with `preset`:
+
+- **`preset voxtral`** — native French, top quality (4B). CC‑BY‑NC‑4.0 (personal only).
+- **`preset kokoro`** — native French (`ff_siwis`), tiny 82M → **faster than real-time, no thermal throttle**, **Apache‑2.0 (commercial-friendly)**. Lower fidelity than Voxtral but very usable.
+
+For personal Claude Code reading, Voxtral sounds best; for a fanless Mac or a commercial product, Kokoro. The server is model-agnostic (mlx-audio's generic loader) — point `voxtral_model` at any mlx-audio TTS model and set `voice`/`lang_code` to add your own.
+
+**License caveat.** Voxtral weights are **CC‑BY‑NC‑4.0 (non-commercial)** — use `kokoro` (Apache‑2.0) for anything commercial.
 
 ### ⚠️ Performance note (read this)
 
@@ -108,6 +115,7 @@ Env overrides for one run: `CLAUDE_TTS_ENGINE`, `CLAUDE_TTS_VOICE`, `CLAUDE_TTS_
 ```text
 claude-tts install [--mode local|spool] [--engine E] [--voice V] [--rate N] [--piper-model PATH]
 claude-tts setup-voxtral [--voice fr_female]   # bootstrap + enable the neural voice
+claude-tts preset voxtral|kokoro               # switch neural voice (reloads the model)
 claude-tts uninstall [--purge]                 # remove hooks (--purge also deletes config/venv/cache)
 claude-tts say "some text"                     # test the current engine (also reads stdin)
 claude-tts doctor                              # diagnostics: engines, config, hooks, server, daemons
