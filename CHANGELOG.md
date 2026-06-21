@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.2
+
+- A daemon that died and was restarted mid-turn by the keep-alive used to replay
+  the whole turn from the top. The keep-alive now restarts it from the current
+  end of the transcript (`--from-end`); only a fresh turn starts from the top.
+
 ## 1.3.1
 
 - Bootstrap now fails with a clear message if Python is older than 3.10 (mlx

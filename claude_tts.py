@@ -32,7 +32,7 @@ import subprocess
 import sys
 import time
 
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 
 HOME = os.path.expanduser("~")
 CLAUDE_DIR = os.path.join(HOME, ".claude")
@@ -680,14 +680,20 @@ def _daemon_running(session):
         return False
 
 
-def _start_daemon(session, transcript):
-    """Ensure a transcript-tailing speak daemon is running for this session."""
+def _start_daemon(session, transcript, from_end=False):
+    """Ensure a transcript-tailing speak daemon is running for this session.
+    `from_end` (the mid-turn keep-alive) starts a restarted daemon at the current
+    end of the transcript, so a daemon that died mid-turn never replays the turn
+    from the top when it comes back."""
     if not transcript or not session or _daemon_running(session):
         return
     py = sys.executable or "python3"
     selfpath = os.path.abspath(__file__)
+    argv = [py, selfpath, "daemon", session, transcript]
+    if from_end:
+        argv.append("--from-end")
     try:
-        subprocess.Popen([py, selfpath, "daemon", session, transcript],
+        subprocess.Popen(argv,
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL,
                          start_new_session=(os.name == "posix"))
@@ -1355,9 +1361,9 @@ def cmd_hook(_args):
         return 0
     if event == "UserPromptSubmit":
         _daemon_hush(session)            # cut the previous turn's speech at once
-        _start_daemon(session, tpath)    # ensure the daemon is up for this turn
+        _start_daemon(session, tpath)    # fresh turn: catch it from the start
     elif event == "PreToolUse":
-        _start_daemon(session, tpath)    # cheap keep-alive: restart if it died
+        _start_daemon(session, tpath, from_end=True)   # keep-alive: never replay
     if cfg.get("engine") == "voxtral":
         _start_server(cfg)               # pre-warm so blocks never wait cold
     return 0
