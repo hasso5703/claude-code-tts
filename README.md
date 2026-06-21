@@ -1,19 +1,21 @@
 # claude-code-tts 🔊
 
-**Listen to [Claude Code](https://www.claude.com/product/claude-code)'s replies instead of reading them — spoken live, block by block, as Claude writes them.**
+**Listen to [Claude Code](https://www.claude.com/product/claude-code)'s replies instead of reading them — spoken live, block by block, in a natural French (or English) voice, fully on your machine.**
 
-Two engines:
+Pick your engine:
 
-- **`say` / espeak / piper** — zero-dependency, instant, built into the OS.
-- **`voxtral`** — a real neural multilingual voice ([Mistral's Voxtral‑4B‑TTS](https://huggingface.co/mistralai/Voxtral-4B-TTS-2603)) running **fully locally** on Apple Silicon via [mlx-audio](https://github.com/Blaizzy/mlx-audio). Natural **French** *and* English (and 7 more languages).
+- **`kokoro`** ⚡ — neural, **native French** (`ff_siwis`), tiny (82M) → **faster than real-time, never thermally throttles**, **Apache-2.0 (commercial-friendly)**. The recommended default.
+- **`voxtral`** — neural, native French (`fr_female` / `fr_male`), **top quality** ([Mistral's 4B](https://huggingface.co/mistralai/Voxtral-4B-TTS-2603)). CC-BY-NC (personal use). Best fidelity, heavier.
+- **`say` / espeak / piper** — zero-dependency OS voices; instant, robotic, nothing to install.
+
+Both neural voices run **100% locally** on Apple Silicon via [mlx-audio](https://github.com/Blaizzy/mlx-audio), and you flip between them with one command.
 
 Highlights:
 
-- ✅ **Live streaming.** A background daemon tails the conversation transcript and speaks each block the instant Claude writes it — no waiting for the turn to end, no lag.
-- ✅ **Barge-in.** Start typing and the current speech stops immediately.
-- ✅ **Sequential, gap-aware playback.** Blocks are split into sentences and the next is synthesized while the current one plays.
-- ✅ **Safe, reversible installer.** Merges into `~/.claude/settings.json` (with a `.bak`); never clobbers your other hooks.
-- ✅ **Core is single-file, stdlib-only.** The neural engine is an *optional* upgrade isolated in its own venv — the hook that Claude Code runs never imports anything heavy.
+- ✅ **Live streaming.** A background daemon tails the conversation transcript and speaks each block the instant Claude writes it — no waiting for the turn to end.
+- ✅ **Barge-in** (start typing → speech stops) and **gap-aware playback** (split into sentences, the next is synthesized while the current plays).
+- ✅ **One-command voice switch** — `preset kokoro` / `preset voxtral`.
+- ✅ **Safe, reversible installer.** Merges into `~/.claude/settings.json` (with a `.bak`); the hook Claude Code runs is **stdlib-only** — heavy deps live in an isolated venv.
 
 ---
 
@@ -23,45 +25,48 @@ Highlights:
 git clone https://github.com/hasso5703/claude-code-tts.git
 cd claude-code-tts
 
-# Basic: instant OS voice (macOS `say`, Linux espeak/piper)
-./install.sh
+# Recommended — fast, commercial-friendly French neural voice (macOS Apple Silicon):
+python3 claude_tts.py setup-kokoro
 
-# — or — neural French/English voice (macOS Apple Silicon):
-python3 claude_tts.py setup-voxtral        # creates a venv, installs mlx-audio,
-                                            # downloads the model (~2.5 GB), wires hooks
+#  …or top-quality French (heavier, non-commercial):
+python3 claude_tts.py setup-voxtral
+
+#  …or no setup at all — instant robotic OS voice:
+./install.sh
 ```
 
 Then **restart Claude Code** (hooks load at startup) — or open `/hooks` inside it. Talk to Claude → hear the reply.
 
-> `doctor` shows everything: `python3 claude_tts.py doctor`
+> `setup-kokoro` / `setup-voxtral` are idempotent and install **both** neural voices' deps, so you can `preset` between them anytime. See everything with `python3 claude_tts.py doctor`.
 
 ---
 
-## The neural voice (Voxtral)
+## The two neural voices
 
-`setup-voxtral` (or `install --engine voxtral`) does the whole bootstrap and is idempotent:
+| | **`kokoro`** (recommended) | **`voxtral`** |
+|---|---|---|
+| French | native (`ff_siwis`) | native (`fr_female` / `fr_male`) |
+| Quality | good | **top** |
+| Speed | **RTF ~0.5× — faster than real-time, never throttles** | ~1× (throttles on a fanless Air under long output) |
+| Footprint | 82M (~0.3 GB download, ~1.8 GB RAM) | 4B (~2.5 GB download, ~2.7 GB RAM) |
+| License | **Apache-2.0 (commercial OK)** | CC-BY-NC-4.0 (personal only) |
 
-1. checks you're on **macOS + Apple Silicon** (MLX requirement; otherwise it falls back to `say`),
-2. creates a venv at `~/.claude/tts/venv` and installs `mlx-audio` + `mistral-common[audio]`,
-3. downloads `mlx-community/Voxtral-4B-TTS-2603-mlx-4bit` (~2.5 GB, cached by Hugging Face),
-4. sets `engine=voxtral`, `voice=fr_female`, wires the hooks, and starts the model server.
+Switch anytime — it reloads the model in seconds:
 
-**How it runs.** A small persistent HTTP server (`tts-server`, in the venv) loads the model **once** and synthesizes on demand on `127.0.0.1:8765`. The stdlib-only hook/daemon talk to it over the loopback, get a WAV back, and play it with `afplay`. The server self-exits after 30 min idle and auto-restarts on demand.
+```bash
+python3 claude_tts.py preset kokoro
+python3 claude_tts.py preset voxtral
+```
 
-**Voices** (set `voice` in the config): French `fr_female` / `fr_male`; generic/English `casual_female`, `casual_male`, `neutral_female`, `neutral_male`, `cheerful_female`; and per-language `de_*`, `es_*`, `it_*`, `pt_*`, `nl_*`, `ar_male`, `hi_*`. Voxtral is multilingual — the voice carries the timbre/accent, the text carries the language.
+**Rule of thumb:** fanless Mac or a commercial product → **kokoro**; maximum fidelity on a Mac with a fan → **voxtral**.
 
-**Two voices, one command.** `setup-voxtral` installs both; flip any time with `preset`:
+**How it runs.** A small persistent server (`tts-server`, in the bundled venv) loads the model **once** and synthesizes on `127.0.0.1:8765`. The stdlib-only hook/daemon POST text, get a WAV back, and play it with `afplay`. The server self-exits after 30 min idle and auto-restarts on demand.
 
-- **`preset voxtral`** — native French, top quality (4B). CC‑BY‑NC‑4.0 (personal only).
-- **`preset kokoro`** — native French (`ff_siwis`), tiny 82M → **faster than real-time, no thermal throttle**, **Apache‑2.0 (commercial-friendly)**. Lower fidelity than Voxtral but very usable.
+**What setup does (idempotent).** Checks **macOS + Apple Silicon + Python ≥ 3.10** (otherwise falls back to `say`); creates `~/.claude/tts/venv` and installs `mlx-audio` plus both voices' text deps (`mistral-common[audio]` for Voxtral; `misaki[en]` + `phonemizer-fork` + `espeakng-loader` for Kokoro — `espeakng-loader` bundles espeak-ng, so **no system install**); downloads the model; **auto-patches a Kokoro mlx-audio bug** (a phase-length mismatch in `istftnet` that crashed some inputs to `say`); wires the hooks; starts the server.
 
-For personal Claude Code reading, Voxtral sounds best; for a fanless Mac or a commercial product, Kokoro. The server is model-agnostic (mlx-audio's generic loader) — point `voxtral_model` at any mlx-audio TTS model and set `voice`/`lang_code` to add your own.
+**Voices.** Kokoro French: `ff_siwis`. Voxtral French: `fr_female`, `fr_male`; plus generic/English `casual_*`, `neutral_*`, `cheerful_female`, and per-language `de_*`, `es_*`, `it_*`, `pt_*`, `nl_*`, `ar_male`, `hi_*`. Set `voice` in the config (Kokoro also needs `lang_code`, e.g. `f` = French). The server is model-agnostic — point `voxtral_model` at any mlx-audio TTS model and set `voice` / `lang_code` to add your own.
 
-**License caveat.** Voxtral weights are **CC‑BY‑NC‑4.0 (non-commercial)** — use `kokoro` (Apache‑2.0) for anything commercial.
-
-### ⚠️ Performance note (read this)
-
-Voxtral‑4B is a 4‑billion‑parameter model. On Macs **with a fan** (M‑series Pro/Max) it generates **faster than real-time** and streaming is seamless. On the **fanless MacBook Air**, a cold/bursty response is fine (~1× real-time), but a **long, continuous** response heats the chip and it thermally throttles (2–5× real-time) → audible gaps. If that bothers you on an Air, switch `voxtral_model` to a lighter model (e.g. a Qwen3‑TTS `0.6B`/`1.7B`) or use `engine=say`. The plumbing is identical; only the model changes.
+**Speed.** `speed` in the config (e.g. `1.1`) is applied per request — no restart needed.
 
 ---
 
@@ -76,7 +81,8 @@ Voxtral‑4B is a 4‑billion‑parameter model. On Macs **with a fan** (M‑ser
                                          │   split into sentences → queue
                                          ▼
                               sequential drainer plays them in order
-                       (engine=say: OS voice │ engine=voxtral: local model server)
+                   (engine=say: OS voice │ engine=voxtral: local model server,
+                                            running kokoro or voxtral weights)
 ```
 
 - `UserPromptSubmit` starts the daemon and cuts off the previous turn (barge-in).
@@ -89,22 +95,24 @@ Set `stream=false` to fall back to the classic behaviour: speak only the final a
 
 ## Configuration
 
-`~/.claude/tts/config.json` (or pass flags at install / `setup-voxtral`):
+`~/.claude/tts/config.json` (or pass flags at install / setup):
 
 | Key              | Default                                   | Meaning |
 |------------------|-------------------------------------------|---------|
 | `mode`           | `local`                                   | `local` = speak here. `spool` = only record (for a remote listener). |
-| `engine`         | `auto`                                    | `auto`, `say`, `espeak-ng`, `spd-say`, `festival`, `piper`, **`voxtral`**. |
-| `voice`          | `""` (`fr_female` for voxtral)            | Engine-specific voice. |
+| `engine`         | `auto`                                    | `auto`, `say`, `espeak-ng`, `spd-say`, `festival`, `piper`, **`voxtral`** (the local model server — runs the kokoro/voxtral weights). |
+| `voice`          | `""`                                      | Engine-specific voice. Neural: `ff_siwis` (kokoro), `fr_female` (voxtral). |
+| `lang_code`      | `""`                                      | Language for engines that need it — **kokoro: `f`** = French. |
+| `speed`          | `1.0`                                     | Playback speed (kokoro applies it; voxtral ignores it). |
 | `stream`         | `true`                                    | Speak each block live (daemon). `false` = one shot at end of turn. |
 | `barge_in`       | `true`                                    | A new turn interrupts the current speech. |
 | `rate`           | `null`                                    | Speed for `say`/`espeak-ng` (wpm) / `spd-say` (−100..100). |
 | `max_chars`      | `0`                                       | Truncate spoken text (0 = no limit). |
 | `piper_model`    | `""`                                      | Path to a piper `.onnx` voice (engine=piper). |
-| `voxtral_model`  | `mlx-community/Voxtral-4B-TTS-2603-mlx-4bit` | Any mlx-audio TTS model id. |
+| `voxtral_model`  | Voxtral 4B (Kokoro after `preset kokoro`) | Any mlx-audio TTS model id. |
 | `voxtral_port`   | `8765`                                    | Local model-server port. |
 | `voxtral_python` | `""`                                      | Python with mlx-audio (`""` = the bundled venv). |
-| `say_voice`      | `""`                                      | `say` voice used if the neural server is ever unavailable (auto-picks a French voice). |
+| `say_voice`      | `""`                                      | `say` voice for the rare fallback if the server is down (auto-picks a French voice). |
 
 Env overrides for one run: `CLAUDE_TTS_ENGINE`, `CLAUDE_TTS_VOICE`, `CLAUDE_TTS_RATE`, `CLAUDE_TTS_MODE`.
 
@@ -113,12 +121,13 @@ Env overrides for one run: `CLAUDE_TTS_ENGINE`, `CLAUDE_TTS_VOICE`, `CLAUDE_TTS_
 ## Commands
 
 ```text
-claude-tts install [--mode local|spool] [--engine E] [--voice V] [--rate N] [--piper-model PATH]
-claude-tts setup-voxtral [--voice fr_female]   # bootstrap + enable the neural voice
-claude-tts preset voxtral|kokoro               # switch neural voice (reloads the model)
-claude-tts uninstall [--purge]                 # remove hooks (--purge also deletes config/venv/cache)
+claude-tts setup-kokoro [--voice ff_siwis]     # enable Kokoro (fast/light, Apache-2.0)
+claude-tts setup-voxtral [--voice fr_female]   # enable Voxtral (top quality, CC-BY-NC)
+claude-tts preset kokoro|voxtral               # switch neural voice (reloads the model)
+claude-tts install [--mode local|spool] [--engine E] [--voice V] [--no-stream]
 claude-tts say "some text"                     # test the current engine (also reads stdin)
 claude-tts doctor                              # diagnostics: engines, config, hooks, server, daemons
+claude-tts uninstall [--purge]                 # remove hooks (--purge also deletes config/venv)
 claude-tts listen [--ssh HOST] [--spool PATH]  # remote mode: tail+speak a server's spool
 ```
 
@@ -140,11 +149,11 @@ Start with **`doctor`** if anything misbehaves.
 
 ## Troubleshooting
 
-- **Nothing spoken** → restart Claude Code after install; check `doctor` (`hooks wired`, `daemon(s)`, and for voxtral `server UP`).
-- **Robotic voice on French** → that's the `say` fallback; it means the neural server wasn't ready. Check `doctor` → `voxtral … server`; `tail ~/.claude/tts/server.log`.
-- **Voxtral setup skipped** → you're not on Apple Silicon, or `python3 -m venv` failed / Python is too old (need 3.10+). It falls back to `say`.
-- **Gaps on long responses (fanless Air)** → see the performance note above.
-- **Reset the server** → `pkill -f "claude_tts.py tts-server"` (it auto-restarts on the next block).
+- **Nothing spoken** → restart Claude Code after install; check `doctor` (`hooks wired`, `daemon(s)`, and `server UP`).
+- **Robotic voice / `say` creeps in** → the neural server wasn't reachable. Check `doctor`; `tail ~/.claude/tts/server.log`. Reset it with `pkill -f "claude_tts.py tts-server"` (auto-restarts on the next block).
+- **Setup skipped / fell back to `say`** → you're not on Apple Silicon, or Python is older than 3.10 (`python3 -m venv` needs ≥ 3.10).
+- **Gaps on long responses (fanless Air)** → that's Voxtral throttling; `preset kokoro` removes it.
+- **Slow first model download** → set a `HF_TOKEN` (`~/.cache/huggingface/token`) for higher Hugging Face rate limits.
 
 ---
 
@@ -166,4 +175,4 @@ Issues and PRs welcome — keep the **hook path standard-library only** (heavy d
 
 ## License
 
-MIT — see [LICENSE](LICENSE). (The optional Voxtral *model weights* are CC‑BY‑NC‑4.0, owned by Mistral AI; this tool just calls them.)
+MIT — see [LICENSE](LICENSE). The tool just *calls* the models; their weights keep their own licenses: **Kokoro = Apache-2.0** (commercial OK), **Voxtral = CC-BY-NC-4.0** (Mistral AI, non-commercial).

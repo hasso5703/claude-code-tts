@@ -32,7 +32,7 @@ import subprocess
 import sys
 import time
 
-VERSION = "1.4.2"
+VERSION = "1.4.3"
 
 HOME = os.path.expanduser("~")
 CLAUDE_DIR = os.path.join(HOME, ".claude")
@@ -1530,16 +1530,28 @@ def cmd_preset(args):
     return 0
 
 
-def cmd_setup_voxtral(args):
-    """Friendly alias: enable Voxtral end to end (venv + deps + model + hooks)."""
-    for k, v in (("mode", None), ("rate", None), ("piper_model", None),
-                 ("stream", None)):
+def _setup_preset(name, args):
+    """Enable a neural-voice preset end to end: write its model/voice/language,
+    then run install (venv + deps + model download + hooks + server)."""
+    cfg = load_config()
+    cfg["engine"] = "voxtral"
+    cfg.update(TTS_PRESETS[name])
+    save_config(cfg)
+    for k in ("mode", "rate", "piper_model", "stream"):
         if not hasattr(args, k):
-            setattr(args, k, v)
+            setattr(args, k, None)
     if not hasattr(args, "voice"):
-        args.voice = None
+        args.voice = None          # keep the preset's voice unless --voice given
     args.engine = "voxtral"
     return cmd_install(args)
+
+
+def cmd_setup_voxtral(args):
+    return _setup_preset("voxtral", args)
+
+
+def cmd_setup_kokoro(args):
+    return _setup_preset("kokoro", args)
 
 
 def cmd_speak_file(args):
@@ -1832,9 +1844,14 @@ def build_parser():
     psv.set_defaults(func=cmd_tts_server)
 
     pset = sub.add_parser("setup-voxtral",
-                          help="enable Voxtral neural TTS (venv + model + hooks)")
+                          help="enable Voxtral neural TTS (top quality, CC-BY-NC)")
     pset.add_argument("--voice", default=None)
     pset.set_defaults(func=cmd_setup_voxtral)
+
+    psk = sub.add_parser("setup-kokoro",
+                         help="enable Kokoro neural TTS (fast/light, Apache-2.0)")
+    psk.add_argument("--voice", default=None)
+    psk.set_defaults(func=cmd_setup_kokoro)
 
     ppr = sub.add_parser("preset", help="switch neural voice: voxtral | kokoro")
     ppr.add_argument("name", choices=sorted(TTS_PRESETS))

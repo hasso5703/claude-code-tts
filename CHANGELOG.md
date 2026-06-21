@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.4.3
+
+- `setup-kokoro` command, symmetric to `setup-voxtral`: one step to enable the
+  fast, Apache-2.0 Kokoro voice from a fresh clone (venv + deps + model + hooks).
+- README rewritten to document both neural voices as co-equal options (Kokoro
+  recommended for speed/commercial, Voxtral for top fidelity), with a comparison
+  table, the auto-patch, and per-machine guidance.
+
 ## 1.4.2
 
 - Root-cause fix for the Kokoro broadcast crash. mlx-audio 0.4.4's `_f02sine`
