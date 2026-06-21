@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.3.1
+
+- Bootstrap now fails with a clear message if Python is older than 3.10 (mlx
+  requires >= 3.10) instead of a cryptic pip error, then falls back to `say`.
+
 ## 1.3.0
 
 - New `voxtral` engine: neural multilingual TTS (Mistral's Voxtral-4B-TTS) via a

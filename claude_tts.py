@@ -32,7 +32,7 @@ import subprocess
 import sys
 import time
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 
 HOME = os.path.expanduser("~")
 CLAUDE_DIR = os.path.join(HOME, ".claude")
@@ -999,6 +999,10 @@ def _bootstrap_voxtral():
     a fresh clone works end to end. Returns (ok, message). Idempotent."""
     if not _voxtral_available():
         return False, "Voxtral needs macOS on Apple Silicon (MLX)."
+    if sys.version_info < (3, 10):
+        return False, ("Voxtral needs Python >= 3.10 (mlx requirement); this is "
+                       "%d.%d. Install a newer python3 and re-run." %
+                       sys.version_info[:2])
     venv_dir = os.path.join(TTS_DIR, "venv")
     py = VENV_PY
     if not os.path.exists(py):
