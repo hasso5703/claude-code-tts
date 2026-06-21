@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.4.2
+
+- Root-cause fix for the Kokoro broadcast crash. mlx-audio 0.4.4's `_f02sine`
+  down- then up-samples the phase, which drifts its length by a few samples so
+  the harmonic source no longer broadcasts against `uv`. The bootstrap now
+  patches `istftnet.py` to clamp the phase back to the input length (idempotent,
+  applied on every install). Verified: 0 synth errors across short single words
+  and long sentences, where before some inputs reliably crashed → `say`. The
+  text-retry workaround from 1.4.1 stays as a belt-and-suspenders.
+
 ## 1.4.1
 
 - Kokoro robustness: only pass parameters a model declares (max_tokens to

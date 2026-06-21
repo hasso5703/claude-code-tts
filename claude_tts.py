@@ -32,7 +32,7 @@ import subprocess
 import sys
 import time
 
-VERSION = "1.4.1"
+VERSION = "1.4.2"
 
 HOME = os.path.expanduser("~")
 CLAUDE_DIR = os.path.join(HOME, ".claude")
@@ -1039,6 +1039,7 @@ def _bootstrap_voxtral():
                             "misaki[en]", "phonemizer-fork", "espeakng-loader"])  # Kokoro
         if r.returncode != 0 or not _venv_has_deps(py):
             return False, "pip install of mlx-audio failed"
+    _patch_kokoro_istftnet(py)   # fix the mlx-audio Kokoro broadcast bug
     return True, "ok"
 
 
@@ -1048,6 +1049,40 @@ def _model_cached(model):
     return os.path.isdir(cache) and any(
         f.endswith(".safetensors")
         for _r, _d, fs in os.walk(cache) for f in fs)
+
+
+def _patch_kokoro_istftnet(py):
+    """Fix an mlx-audio 0.4.4 bug: Kokoro's _f02sine down/up-samples the phase,
+    drifting its length by a few samples, which then can't broadcast against uv
+    (the '[broadcast_shapes] (1,N,1) and (1,M,9)' crash). Clamp the phase back to
+    the input length. Idempotent; safe to call on every bootstrap."""
+    try:
+        out = subprocess.run(
+            [py, "-c", "import mlx_audio.tts.models.kokoro.istftnet as m; "
+             "print(m.__file__)"], capture_output=True, text=True)
+        path = (out.stdout or "").strip()
+        if not path or not os.path.isfile(path):
+            return False
+        src = open(path, encoding="utf-8").read()
+        if "claude-tts length-align" in src:
+            return True
+        anchor = "            ).transpose(0, 2, 1)\n            sines = mx.sin(phase)"
+        if anchor not in src:
+            return False
+        fix = (
+            "            ).transpose(0, 2, 1)\n"
+            "            _L = f0_values.shape[1]  # claude-tts length-align\n"
+            "            if phase.shape[1] > _L:\n"
+            "                phase = phase[:, :_L, :]\n"
+            "            elif phase.shape[1] < _L:\n"
+            "                phase = mx.concatenate([phase, mx.broadcast_to(\n"
+            "                    phase[:, -1:, :], (phase.shape[0],\n"
+            "                    _L - phase.shape[1], phase.shape[2]))], axis=1)\n"
+            "            sines = mx.sin(phase)")
+        open(path, "w", encoding="utf-8").write(src.replace(anchor, fix, 1))
+        return True
+    except Exception:
+        return False
 
 
 def _download_voxtral_model(cfg):
