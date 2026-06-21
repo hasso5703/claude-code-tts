@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.4.1
+
+- Kokoro robustness: only pass parameters a model declares (max_tokens to
+  Voxtral, lang_code to Kokoro - forwarding extras via **kwargs broke Kokoro),
+  and work around an mlx-audio 0.4.4 broadcast bug on short segments ending in
+  punctuation (e.g. "Bonjour.") by retrying once without the trailing
+  punctuation (inaudible). The istftnet harmonic source length can mismatch the
+  spectral length on short inputs; this sidesteps it.
+- Robust model swap: `_stop_server` now sweeps every stray server process, so a
+  stale pid file can no longer leave an old model holding the port (which made
+  `preset` silently not switch).
+- CI: exercises both `--no-stream` (Stop hook → spool) and stream mode (daemon
+  hooks wired, hook events don't crash).
+
 ## 1.4.0
 
 - Switchable voice presets via `preset voxtral|kokoro` (one command, reloads the

@@ -32,7 +32,7 @@ import subprocess
 import sys
 import time
 
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 
 HOME = os.path.expanduser("~")
 CLAUDE_DIR = os.path.join(HOME, ".claude")
@@ -991,6 +991,12 @@ def _stop_server():
                 signal.SIGTERM)
     except Exception:
         pass
+    # Also sweep any stray server (robust against a stale pid file / old model).
+    try:
+        subprocess.run(["pkill", "-f", "claude_tts.py tts-server"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
 
 
 def _voxtral_available():
@@ -1247,26 +1253,46 @@ def _tts_server(port):
         return buf.getvalue()
 
     def _worker():
+        import inspect
         # Load and run the model in THIS thread only: MLX GPU streams are
         # per-thread, so generate() must run where the model was created.
         model = load_model(cfg.get("voxtral_model") or DEFAULT_VOXTRAL_MODEL)
         sr0 = int(getattr(model, "sample_rate", 24000) or 24000)
+        named = set(inspect.signature(model.generate).parameters)
         state["ready"] = True
+
+        def _gen(t, voice, lang, speed):
+            # Pass ONLY parameters the model declares explicitly - forwarding
+            # extras through **kwargs breaks some models (Kokoro).
+            gkw = {"text": t, "voice": voice}
+            if "speed" in named:
+                gkw["speed"] = speed
+            if lang and "lang_code" in named:
+                gkw["lang_code"] = lang
+            if "max_tokens" in named:
+                gkw["max_tokens"] = int(min(900, max(200, len(t) * 4)))
+            chunks, sr = [], sr0
+            for res in model.generate(**gkw):
+                a = np.asarray(res.audio, dtype=np.float32).reshape(-1)
+                if a.size:
+                    chunks.append(a)
+                sr = int(getattr(res, "sample_rate", sr) or sr)
+            return chunks, sr
+
         while True:
             text, voice, lang, speed, out = jobs.get()
             try:
-                chunks, sr = [], sr0
-                # Both Voxtral and Kokoro take **kwargs: Voxtral uses max_tokens
-                # (ignores lang_code), Kokoro uses lang_code (ignores max_tokens).
-                gkw = {"text": text, "voice": voice, "speed": speed,
-                       "max_tokens": int(min(900, max(200, len(text) * 4)))}
-                if lang:
-                    gkw["lang_code"] = lang
-                for res in model.generate(**gkw):
-                    a = np.asarray(res.audio, dtype=np.float32).reshape(-1)
-                    if a.size:
-                        chunks.append(a)
-                    sr = int(getattr(res, "sample_rate", sr) or sr)
+                try:
+                    chunks, sr = _gen(text, voice, lang, speed)
+                except Exception:
+                    # Kokoro can throw an mlx broadcast error on a short segment
+                    # ending in punctuation; retry once without the trailing
+                    # period/!? (inaudible here).
+                    t2 = text.strip().rstrip(".!?…\"')]")
+                    if t2 and t2 != text:
+                        chunks, sr = _gen(t2, voice, lang, speed)
+                    else:
+                        raise
                 audio = (np.concatenate(chunks) if chunks
                          else np.zeros(0, dtype=np.float32))
                 out["wav"] = _to_wav(audio, sr)

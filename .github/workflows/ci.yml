@@ -15,13 +15,18 @@ jobs:
       - name: install / hook / uninstall in an isolated HOME
         run: |
           export HOME="$GITHUB_WORKSPACE/_home"; mkdir -p "$HOME"
-          python claude_tts.py install --mode spool
           printf '%s\n' \
             '{"type":"user","message":{"role":"user","content":"hi"}}' \
             '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Hello **world** `x`."}]}}' \
             > "$HOME/t.jsonl"
+          # single-shot mode: the Stop hook extracts + cleans + writes the spool
+          python claude_tts.py install --mode spool --no-stream
           printf '{"session_id":"ci","transcript_path":"%s","hook_event_name":"Stop"}' "$HOME/t.jsonl" | python claude_tts.py hook
           test -s "$HOME/.claude/tts/spool.ndjson" && echo "spool written OK"
           grep -q '"text": "Hello world x."' "$HOME/.claude/tts/spool.ndjson"
+          # stream mode (the default): wires the daemon hooks and they must not crash
+          python claude_tts.py install --mode spool --stream
+          python claude_tts.py doctor | grep -q "PreToolUse"
+          printf '{"session_id":"ci","hook_event_name":"SessionEnd"}' | python claude_tts.py hook
           python claude_tts.py doctor
           python claude_tts.py uninstall --purge
