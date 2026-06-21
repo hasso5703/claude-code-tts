@@ -4,9 +4,14 @@
 # Usage (from a clone):
 #   ./install.sh [--mode local|spool] [--voice NAME] [--rate N] [--engine E]
 #
-# Usage (one-liner, after you publish the repo):
-#   CCTTS_RAW_URL="https://raw.githubusercontent.com/<you>/claude-code-tts/main/claude_tts.py" \
-#     bash -c "$(curl -fsSL https://raw.githubusercontent.com/<you>/claude-code-tts/main/install.sh)"
+# Neural French/English voice (macOS Apple Silicon) — creates a venv, installs
+# mlx-audio, downloads the model, wires hooks:
+#   ./install.sh --engine voxtral
+#   # or the friendly alias:  python3 claude_tts.py setup-voxtral
+#
+# Usage (one-liner):
+#   CCTTS_RAW_URL="https://raw.githubusercontent.com/hasso5703/claude-code-tts/main/claude_tts.py" \
+#     bash -c "$(curl -fsSL https://raw.githubusercontent.com/hasso5703/claude-code-tts/main/install.sh)"
 set -euo pipefail
 
 # Find a Python 3 interpreter.

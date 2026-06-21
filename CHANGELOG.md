@@ -1,5 +1,35 @@
 # Changelog
 
+## 1.3.0
+
+- New `voxtral` engine: neural multilingual TTS (Mistral's Voxtral-4B-TTS) via a
+  persistent local mlx-audio server, for far more natural French/English than
+  the OS `say`. The server loads the model once and synthesizes over HTTP, so
+  the per-block cost is just inference (no reload).
+- One-command bootstrap: `setup-voxtral` (or `install --engine voxtral`) detects
+  Apple Silicon, creates the bundled venv, installs `mlx-audio` +
+  `mistral-common[audio]`, pre-downloads the model, wires hooks, and starts the
+  server. Idempotent; falls back to `say` off Apple Silicon.
+- `tts-server`: model host runs in the venv; the stdlib-only hook/daemon talk to
+  it over `127.0.0.1`. Binds the port BEFORE loading (a duplicate launch fails
+  fast), serves `/health` on HTTP threads, and runs ALL MLX work in one worker
+  thread (MLX GPU streams are per-thread). Pre-warmed by the hooks; self-exits
+  after 30 min idle; single-instance via a socket guard.
+- Pipelined drain: the next block is synthesized while the current one plays.
+  Blocks are split into sentences for lower latency and steadier pacing, and
+  `max_tokens` is capped per chunk to kill runaway generation.
+- Robust fallback: retries while the server is still loading (so the first block
+  waits for the neural voice instead of dropping to `say`), and when it must use
+  `say` it picks a French voice. Temp WAVs are always reclaimed; stale ones from
+  a killed player are swept.
+- Config: `engine=voxtral`, `voice` (e.g. `fr_female`/`fr_male`), `voxtral_model`
+  (any mlx-audio model), `voxtral_port`, `voxtral_python`, `say_voice`. `doctor`
+  reports the server and running daemons; `uninstall --purge` removes the venv.
+- NOTE: Voxtral weights are CC-BY-NC-4.0 (non-commercial). The server is
+  model-agnostic — point `voxtral_model` at a Qwen3-TTS MLX model for Apache-2.0.
+  Perf: faster-than-real-time on Macs with a fan; the fanless Air throttles under
+  long continuous responses (use a lighter model or `say` there).
+
 ## 1.2.0
 
 - Stream mode is now driven by a transcript-tailing daemon instead of the

@@ -32,7 +32,7 @@ import subprocess
 import sys
 import time
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 HOME = os.path.expanduser("~")
 CLAUDE_DIR = os.path.join(HOME, ".claude")
@@ -49,6 +49,11 @@ QUEUE_DIR = os.path.join(TTS_DIR, "queue")   # per-session audio queues (stream 
 DEBUG_FLAG = os.path.join(TTS_DIR, "DEBUG")  # touch this file to log hook activity
 HOOK_LOG = os.path.join(TTS_DIR, "hook.log")
 DAEMON_IDLE = 1800   # stream daemon exits after this many idle seconds
+DEFAULT_VOXTRAL_MODEL = "mlx-community/Voxtral-4B-TTS-2603-mlx-4bit"
+DEFAULT_VOXTRAL_PORT = 8765
+SERVER_IDLE = 1800   # Voxtral server exits after this many idle seconds
+VENV_PY = os.path.join(TTS_DIR, "venv", "bin", "python")  # venv with mlx-audio
+SERVER_PID = os.path.join(TTS_DIR, "server.pid")
 INSTALLED_SELF = os.path.join(TTS_DIR, "claude_tts.py")
 HOOK_MARKER = "claude_tts.py"          # identifies our hook inside settings.json
 # Events we wire. Stream mode runs a transcript-tailing daemon: UserPromptSubmit
@@ -64,7 +69,7 @@ DEFAULT_CONFIG = {
     "mode": "local",      # "local": the hook speaks on this machine.
                           # "spool": the hook only writes the spool (remote box;
                           #          a `listen` client elsewhere does the talking).
-    "engine": "auto",     # auto | say | espeak-ng | spd-say | festival | piper
+    "engine": "auto",     # auto | say | espeak-ng | spd-say | festival | piper | voxtral
     "voice": "",          # engine-specific voice name; "" = engine default
     "rate": None,         # engine-specific speed; None = engine default
     "barge_in": True,     # a new response interrupts speech in progress
@@ -72,6 +77,12 @@ DEFAULT_CONFIG = {
                           #   at end of turn. Block-level (no token streaming).
     "max_chars": 0,       # truncate spoken text to N chars (0 = no limit)
     "piper_model": "",    # path to a piper .onnx voice (engine=piper)
+    # --- engine=voxtral: neural TTS (Mistral) via a persistent mlx-audio server ---
+    "speed": 1.0,         # playback speed hint (Voxtral currently ignores it)
+    "say_voice": "",      # macOS `say` voice used as fallback if the server is down
+    "voxtral_model": DEFAULT_VOXTRAL_MODEL,
+    "voxtral_port": DEFAULT_VOXTRAL_PORT,
+    "voxtral_python": "", # python with mlx-audio; "" = the bundled venv
 }
 
 
@@ -312,6 +323,8 @@ def which(b):
 
 def detect_engine(cfg):
     e = cfg.get("engine", "auto")
+    if e == "voxtral":
+        return "voxtral"
     if e and e != "auto":
         return e if which(e.split()[0]) or e == "say" else (e if which(e) else None)
     if sys.platform == "darwin" and which("say"):
@@ -379,6 +392,9 @@ def speak(cfg, text, pidfile=PID_FILE, barge=None):
     if not engine:
         sys.stderr.write("[claude-tts] no TTS engine found "
                          "(install macOS say, or espeak-ng / spd-say on Linux)\n")
+        return
+    if engine == "voxtral":
+        _speak_voxtral(cfg, text, pidfile, barge)
         return
     if (cfg.get("barge_in", True) if barge is None else barge):
         _kill_prev(pidfile)
@@ -615,14 +631,17 @@ def _drain(session):
     if lf is not None and not _flock_ex(lf, blocking=False):
         return  # another drainer already owns this session
     try:
-        while True:
-            text = _q_pop(session)
-            if not text:
-                time.sleep(0.05)            # grace for a just-appended block
+        if cfg.get("engine") == "voxtral":
+            _drain_voxtral(session, cfg)
+        else:
+            while True:
                 text = _q_pop(session)
                 if not text:
-                    break
-            speak(cfg, text, pidfile=_qpid(session), barge=False)
+                    time.sleep(0.05)        # grace for a just-appended block
+                    text = _q_pop(session)
+                    if not text:
+                        break
+                speak(cfg, text, pidfile=_qpid(session), barge=False)
     finally:
         if lf is not None:
             try:
@@ -716,6 +735,66 @@ def _turn_start_lineno(transcript):
     return start
 
 
+def _hard_wrap(s, max_len):
+    out = []
+    while len(s) > max_len:
+        cut = s.rfind(", ", 0, max_len)
+        if cut < max_len // 2:
+            cut = s.rfind(" ", 0, max_len)
+        if cut <= 0:
+            cut = max_len
+        out.append(s[:cut + 1].strip())
+        s = s[cut + 1:].strip()
+    if s:
+        out.append(s)
+    return out
+
+
+def _split_sentences(text, max_len=220):
+    """Group text into sentence-sized chunks (<= max_len chars). Synthesizing
+    sentence by sentence keeps each generation short - lower latency, far less
+    thermal build-up, and a runaway generation can only ruin one short chunk."""
+    text = " ".join((text or "").split())
+    if not text:
+        return []
+    if len(text) <= max_len:
+        return [text]
+    pieces = re.split(r"(?<=[.!?…])\s+", text)
+    chunks, cur = [], ""
+    for p in pieces:
+        if not p:
+            continue
+        if len(p) > max_len:
+            if cur:
+                chunks.append(cur)
+                cur = ""
+            chunks.extend(_hard_wrap(p, max_len))
+        elif cur and len(cur) + 1 + len(p) > max_len:
+            chunks.append(cur)
+            cur = p
+        else:
+            cur = (cur + " " + p).strip() if cur else p
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+def _cleanup_stale_wavs(max_age=300):
+    """Remove orphan spk-*.wav left behind by a killed player (e.g. a crash)."""
+    try:
+        now = time.time()
+        for fn in os.listdir(QUEUE_DIR):
+            if fn.startswith("spk-") and fn.endswith(".wav"):
+                p = os.path.join(QUEUE_DIR, fn)
+                try:
+                    if now - os.path.getmtime(p) > max_age:
+                        os.remove(p)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
 def _daemon_handle(session, line, spoken):
     s = line.strip()
     if not s:
@@ -746,7 +825,8 @@ def _daemon_handle(session, line, spoken):
            "chars": len(clean), "text": clean, "raw": raw}
     write_outputs(rec, hashlib.sha1(clean.encode("utf-8")).hexdigest())
     if load_config().get("mode", "local") == "local":
-        _q_append(session, clean)
+        for chunk in _split_sentences(clean):
+            _q_append(session, chunk)
         _spawn_drainer(session)
 
 
@@ -832,6 +912,421 @@ def _daemon(session, transcript, from_end=False):
 
 
 # --------------------------------------------------------------------------- #
+# Voxtral neural TTS (Mistral) via a persistent local mlx-audio server          #
+# --------------------------------------------------------------------------- #
+def _voxtral_py(cfg):
+    return os.path.expanduser(cfg.get("voxtral_python") or VENV_PY)
+
+
+def _server_port(cfg):
+    try:
+        return int(cfg.get("voxtral_port") or DEFAULT_VOXTRAL_PORT)
+    except Exception:
+        return DEFAULT_VOXTRAL_PORT
+
+
+def _server_running(cfg):
+    import urllib.request
+    try:
+        with urllib.request.urlopen(
+                "http://127.0.0.1:%d/health" % _server_port(cfg), timeout=1) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+def _port_open(port):
+    """True if something is already listening on the port (server loading OR
+    ready). Used to avoid spawning a duplicate while the model is loading and
+    /health still returns 503."""
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(0.5)
+    try:
+        return s.connect_ex(("127.0.0.1", port)) == 0
+    except Exception:
+        return False
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
+def _start_server(cfg):
+    """Ensure the persistent Voxtral server (venv python + mlx-audio) is up. The
+    server loads the model once and synthesizes on demand."""
+    if _port_open(_server_port(cfg)):
+        return  # already bound (loading or ready) - don't spawn a duplicate
+    py = _voxtral_py(cfg)
+    if not os.path.exists(py):
+        return
+    try:
+        subprocess.Popen([py, os.path.abspath(__file__), "tts-server",
+                          "--port", str(_server_port(cfg))],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL,
+                         start_new_session=(os.name == "posix"))
+    except Exception:
+        pass
+
+
+def _stop_server():
+    try:
+        os.kill(int(open(SERVER_PID, encoding="utf-8").read().strip()),
+                signal.SIGTERM)
+    except Exception:
+        pass
+
+
+def _voxtral_available():
+    """Voxtral runs on MLX, which is macOS + Apple Silicon only."""
+    import platform
+    return sys.platform == "darwin" and platform.machine() == "arm64"
+
+
+def _venv_has_deps(py):
+    try:
+        return subprocess.run([py, "-c", "import mlx_audio, mistral_common"],
+                              stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL).returncode == 0
+    except Exception:
+        return False
+
+
+def _bootstrap_voxtral():
+    """Create the bundled venv and install mlx-audio + mistral-common[audio] so
+    a fresh clone works end to end. Returns (ok, message). Idempotent."""
+    if not _voxtral_available():
+        return False, "Voxtral needs macOS on Apple Silicon (MLX)."
+    venv_dir = os.path.join(TTS_DIR, "venv")
+    py = VENV_PY
+    if not os.path.exists(py):
+        print("  creating venv at", venv_dir, "...")
+        ensure_dir()
+        r = subprocess.run([sys.executable, "-m", "venv", venv_dir])
+        if r.returncode != 0 or not os.path.exists(py):
+            return False, "could not create venv (need `python3 -m venv`)"
+    if not _venv_has_deps(py):
+        print("  installing mlx-audio + mistral-common[audio] (a few minutes)...")
+        subprocess.run([py, "-m", "pip", "install", "-q", "--upgrade", "pip"])
+        r = subprocess.run([py, "-m", "pip", "install", "-q",
+                            "mlx-audio", "mistral-common[audio]"])
+        if r.returncode != 0 or not _venv_has_deps(py):
+            return False, "pip install of mlx-audio failed"
+    return True, "ok"
+
+
+def _model_cached(model):
+    cache = os.path.expanduser("~/.cache/huggingface/hub/models--"
+                               + model.replace("/", "--"))
+    return os.path.isdir(cache) and any(
+        f.endswith(".safetensors")
+        for _r, _d, fs in os.walk(cache) for f in fs)
+
+
+def _download_voxtral_model(cfg):
+    model = cfg.get("voxtral_model") or DEFAULT_VOXTRAL_MODEL
+    if _model_cached(model):
+        return True
+    py = _voxtral_py(cfg)
+    if not os.path.exists(py):
+        return False
+    print("  downloading model (~2.5 GB, one-time):", model)
+    r = subprocess.run(
+        [py, "-c", "import sys; from huggingface_hub import snapshot_download; "
+         "snapshot_download(sys.argv[1])", model])
+    return r.returncode == 0 and _model_cached(model)
+
+
+def _voxtral_synth(cfg, text):
+    """POST text to the local Voxtral server; write the returned WAV to a temp
+    file and return its path. While the server is still loading the model it
+    answers 503 - we retry for a bit so the FIRST block waits for Voxtral rather
+    than dropping to `say`. Returns None only on real failure."""
+    import urllib.request
+    import urllib.error
+    if not os.path.exists(_voxtral_py(cfg)):
+        return None   # no venv -> the server can never come up; don't stall
+    url = "http://127.0.0.1:%d/speak" % _server_port(cfg)
+    body = json.dumps({"text": text, "voice": cfg.get("voice") or "fr_female",
+                       "speed": cfg.get("speed") or 1.0}).encode("utf-8")
+    deadline = time.time() + 25.0    # model-load window
+    wav = None
+    while True:
+        try:
+            req = urllib.request.Request(
+                url, data=body, headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=180) as r:
+                wav = r.read()
+            break
+        except urllib.error.HTTPError as e:
+            if e.code == 503 and time.time() < deadline:
+                time.sleep(0.5)        # still loading the model
+                continue
+            return None
+        except Exception:
+            if time.time() < deadline:
+                time.sleep(0.5)        # not bound yet
+                continue
+            return None
+    if not wav:
+        return None
+    try:
+        _qdir()
+        import tempfile
+        fd, path = tempfile.mkstemp(suffix=".wav", dir=QUEUE_DIR, prefix="spk-")
+        with os.fdopen(fd, "wb") as f:
+            f.write(wav)
+        return path
+    except Exception:
+        return None
+
+
+def _wav_player(path):
+    if which("afplay"):
+        return ["afplay", path]
+    if which("paplay"):
+        return ["paplay", path]
+    if which("aplay"):
+        return ["aplay", "-q", path]
+    if which("ffplay"):
+        return ["ffplay", "-loglevel", "quiet", "-autoexit", "-nodisp", path]
+    return None
+
+
+def _play_wav_async(path, pidfile):
+    argv = _wav_player(path)
+    if not argv:
+        return None
+    try:
+        p = subprocess.Popen(argv, stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=(os.name == "posix"))
+        _write_pid(p.pid, pidfile)
+        return p
+    except Exception:
+        return None
+
+
+_FR_SAY_VOICE = None
+
+
+def _french_say_voice():
+    """A French macOS `say` voice if one is installed, so the rare fallback at
+    least speaks French. Cached per process."""
+    global _FR_SAY_VOICE
+    if _FR_SAY_VOICE is not None:
+        return _FR_SAY_VOICE
+    _FR_SAY_VOICE = ""
+    if which("say"):
+        try:
+            out = subprocess.run(["say", "-v", "?"], capture_output=True,
+                                 text=True, timeout=5).stdout
+            names = [ln.split()[0] for ln in out.splitlines() if ln.strip()]
+            for pref in ("Thomas", "Audrey", "Aurelie", "Amelie", "Jacques"):
+                if pref in names:
+                    _FR_SAY_VOICE = pref
+                    break
+            else:
+                for ln in out.splitlines():
+                    if "fr_FR" in ln or "fr_CA" in ln:
+                        _FR_SAY_VOICE = ln.split()[0]
+                        break
+        except Exception:
+            pass
+    return _FR_SAY_VOICE
+
+
+def _say_fallback(cfg, text, pidfile):
+    """Speak via the OS `say` engine when the Voxtral server is unavailable -
+    using a French voice if available (the default `say` voice mangles French)."""
+    fb = dict(cfg)
+    fb["engine"] = "say" if which("say") else "auto"
+    fb["voice"] = cfg.get("say_voice") or _french_say_voice()
+    fb["rate"] = None
+    speak(fb, text, pidfile=pidfile, barge=False)
+
+
+def _speak_voxtral(cfg, text, pidfile, barge):
+    _start_server(cfg)
+    wav = _voxtral_synth(cfg, text)
+    if not wav:
+        _say_fallback(cfg, text, pidfile)
+        return
+    if (cfg.get("barge_in", True) if barge is None else barge):
+        _kill_prev(pidfile)
+    p = _play_wav_async(wav, pidfile)
+    if p is not None:
+        p.wait()
+    try:
+        os.remove(wav)
+    except Exception:
+        pass
+
+
+def _drain_voxtral(session, cfg):
+    """Pipelined drain: synthesize the NEXT block while the current one plays, so
+    there is no synthesis gap between blocks (only the first block waits)."""
+    _start_server(cfg)
+    _cleanup_stale_wavs()
+    pending = None   # (text, wav_or_None) already synthesized, ready to play
+    while True:
+        if pending is None:
+            text = _q_pop(session)
+            if not text:
+                time.sleep(0.05)
+                text = _q_pop(session)
+                if not text:
+                    break
+            pending = (text, _voxtral_synth(cfg, text))
+        text, wav = pending
+        pending = None
+        player = _play_wav_async(wav, _qpid(session)) if wav else None
+        if wav is None:
+            _say_fallback(cfg, text, _qpid(session))   # server not ready yet
+        # synthesize the next block while the current one plays
+        nxt = _q_pop(session)
+        if nxt:
+            pending = (nxt, _voxtral_synth(cfg, nxt))
+        if player is not None:
+            player.wait()
+        if wav:
+            try:
+                os.remove(wav)   # always reclaim, even if the player failed
+            except Exception:
+                pass
+
+
+def _tts_server(port):
+    """Persistent TTS server. Bind the port FIRST (a duplicate launch then fails
+    fast, before wasting a 15s / 2.7GB model load). /health is served on HTTP
+    threads (503 while loading, 200 once ready). ALL MLX work runs in ONE worker
+    thread that owns the model - MLX GPU streams are per-thread, so loading and
+    generate() must share a thread. Run under the venv python (lazy imports)."""
+    import io
+    import wave
+    import threading
+    import numpy as np
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from mlx_audio.tts.utils import load_model
+
+    import queue as _queue
+    cfg = load_config()
+    state = {"last": time.time(), "ready": False}
+    jobs = _queue.Queue()
+
+    def _to_wav(audio, sr):
+        pcm = (np.clip(audio, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(int(sr))
+            w.writeframes(pcm)
+        return buf.getvalue()
+
+    def _worker():
+        # Load and run the model in THIS thread only: MLX GPU streams are
+        # per-thread, so generate() must run where the model was created.
+        model = load_model(cfg.get("voxtral_model") or DEFAULT_VOXTRAL_MODEL)
+        sr0 = int(getattr(model, "sample_rate", 24000) or 24000)
+        state["ready"] = True
+        while True:
+            text, voice, out = jobs.get()
+            try:
+                chunks, sr = [], sr0
+                mt = int(min(900, max(200, len(text) * 4)))
+                for res in model.generate(text=text, voice=voice, max_tokens=mt):
+                    a = np.asarray(res.audio, dtype=np.float32).reshape(-1)
+                    if a.size:
+                        chunks.append(a)
+                    sr = int(getattr(res, "sample_rate", sr) or sr)
+                audio = (np.concatenate(chunks) if chunks
+                         else np.zeros(0, dtype=np.float32))
+                out["wav"] = _to_wav(audio, sr)
+            except Exception as e:
+                out["err"] = str(e)
+            finally:
+                out["event"].set()
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            if self.path.startswith("/health"):
+                self.send_response(200 if state["ready"] else 503)
+                self.end_headers()
+                self.wfile.write(b"ok" if state["ready"] else b"loading")
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        def do_POST(self):
+            state["last"] = time.time()
+            if not self.path.startswith("/speak"):
+                self.send_response(404)
+                self.end_headers()
+                return
+            if not state["ready"]:
+                self.send_response(503)
+                self.end_headers()
+                return
+            try:
+                n = int(self.headers.get("Content-Length", 0))
+                req = json.loads(self.rfile.read(n) or b"{}")
+            except Exception:
+                req = {}
+            text = (req.get("text") or "").strip()
+            voice = req.get("voice") or cfg.get("voice") or "fr_female"
+            out = {"event": threading.Event()}
+            jobs.put((text, voice, out))
+            if not out["event"].wait(timeout=120) or "wav" not in out:
+                sys.stderr.write("[claude-tts] synth error: %s\n"
+                                 % out.get("err", "timeout"))
+                self.send_response(500)
+                self.end_headers()
+                return
+            wav = out["wav"]
+            self.send_response(200)
+            self.send_header("Content-Type", "audio/wav")
+            self.send_header("Content-Length", str(len(wav)))
+            self.end_headers()
+            self.wfile.write(wav)
+
+    try:
+        srv = ThreadingHTTPServer(("127.0.0.1", port), H)
+    except OSError as e:
+        sys.stderr.write("[claude-tts] server bind failed: %s\n" % e)
+        return  # someone already owns the port; exit before loading the model
+    srv.daemon_threads = True
+    try:
+        _atomic_write(SERVER_PID, str(os.getpid()))
+    except Exception:
+        pass
+
+    # Serve immediately (health = 503 while loading) and run all MLX work in the
+    # single worker thread (it loads the model and flips ready=True when done).
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    threading.Thread(target=_worker, daemon=True).start()
+
+    # Main thread = idle watchdog; exit (and free the model) after long silence.
+    try:
+        while time.time() - state["last"] <= SERVER_IDLE:
+            time.sleep(30)
+    finally:
+        try:
+            srv.shutdown()
+        except Exception:
+            pass
+        try:
+            os.remove(SERVER_PID)
+        except Exception:
+            pass
+
+
+# --------------------------------------------------------------------------- #
 # Commands                                                                      #
 # --------------------------------------------------------------------------- #
 def cmd_hook(_args):
@@ -853,11 +1348,14 @@ def cmd_hook(_args):
     # block the instant it lands. The hooks only manage that daemon's lifecycle.
     if event == "SessionEnd":
         _stop_daemon(session)
-    elif event == "UserPromptSubmit":
+        return 0
+    if event == "UserPromptSubmit":
         _daemon_hush(session)            # cut the previous turn's speech at once
         _start_daemon(session, tpath)    # ensure the daemon is up for this turn
     elif event == "PreToolUse":
         _start_daemon(session, tpath)    # cheap keep-alive: restart if it died
+    if cfg.get("engine") == "voxtral":
+        _start_server(cfg)               # pre-warm so blocks never wait cold
     return 0
 
 
@@ -910,6 +1408,23 @@ def cmd_drain(args):
 def cmd_daemon(args):
     _daemon(args.session, args.transcript, getattr(args, "from_end", False))
     return 0
+
+
+def cmd_tts_server(args):
+    _tts_server(args.port)
+    return 0
+
+
+def cmd_setup_voxtral(args):
+    """Friendly alias: enable Voxtral end to end (venv + deps + model + hooks)."""
+    for k, v in (("mode", None), ("rate", None), ("piper_model", None),
+                 ("stream", None)):
+        if not hasattr(args, k):
+            setattr(args, k, v)
+    if not hasattr(args, "voice"):
+        args.voice = None
+    args.engine = "voxtral"
+    return cmd_install(args)
 
 
 def cmd_speak_file(args):
@@ -1009,7 +1524,17 @@ def cmd_install(args):
         cfg["piper_model"] = args.piper_model
     if getattr(args, "stream", None) is not None:
         cfg["stream"] = args.stream
+    if cfg.get("engine") == "voxtral":
+        ok, msg = _bootstrap_voxtral()   # create venv + install mlx-audio if needed
+        if not ok:
+            print("  voxtral unavailable:", msg, "- falling back to `say`.")
+            cfg["engine"] = "auto"
+        elif not cfg.get("voice"):
+            cfg["voice"] = "fr_female"
     save_config(cfg)
+    if cfg.get("engine") == "voxtral":
+        _download_voxtral_model(cfg)     # pre-cache the weights (idempotent)
+        _start_server(cfg)               # warm the model now
 
     import shlex
     py = sys.executable or "python3"
@@ -1047,6 +1572,9 @@ def cmd_install(args):
           "(speak each block live)" if cfg.get("stream", True) else "(one shot at end)")
     print("  events  :", ", ".join(events))
     print("  engine  :", detect_engine(cfg) or "NONE - install say/espeak-ng/spd-say")
+    if cfg.get("engine") == "voxtral":
+        print("  voxtral :", cfg.get("voxtral_model"),
+              "(server " + ("up" if _server_running(cfg) else "starting…") + ")")
     if cfg["mode"] == "local":
         print("\nLocal mode: responses will be spoken on THIS machine.")
     else:
@@ -1071,17 +1599,20 @@ def cmd_uninstall(args):
         f.write("\n")
     print("hook removed from", SETTINGS)
     if args.purge:
+        _stop_server()
         for p in (SPOOL, LAST_TXT, LAST_RAW, LAST_JSON, HASH_FILE, PID_FILE,
-                  CONFIG_PATH, INSTALLED_SELF):
+                  CONFIG_PATH, INSTALLED_SELF, SERVER_PID,
+                  os.path.join(TTS_DIR, "server.log")):
             try:
                 os.remove(p)
             except Exception:
                 pass
-        try:
-            shutil.rmtree(QUEUE_DIR)
-        except Exception:
-            pass
-        print("purged", TTS_DIR, "files")
+        for d in (QUEUE_DIR, os.path.join(TTS_DIR, "venv")):
+            try:
+                shutil.rmtree(d)
+            except Exception:
+                pass
+        print("purged", TTS_DIR, "files (config, queue, venv, server state)")
     print("Restart Claude Code to fully deactivate.")
     return 0
 
@@ -1101,6 +1632,9 @@ def cmd_doctor(_args):
     print("  rate      :", cfg["rate"])
     print("  barge_in  :", cfg["barge_in"])
     print("  stream    :", cfg.get("stream", True))
+    if cfg.get("engine") == "voxtral":
+        print("  voxtral   :", cfg.get("voxtral_model"),
+              "(server " + ("UP" if _server_running(cfg) else "down") + ")")
     settings = _read_settings()
     allhooks = settings.get("hooks", {})
     wired = [ev for ev in ALL_EVENTS
@@ -1176,6 +1710,16 @@ def build_parser():
     pdm.add_argument("--from-end", dest="from_end", action="store_true",
                      help="start at end of transcript (skip the current backlog)")
     pdm.set_defaults(func=cmd_daemon)
+
+    psv = sub.add_parser("tts-server",
+                         help="(internal) persistent Voxtral TTS server")
+    psv.add_argument("--port", type=int, default=DEFAULT_VOXTRAL_PORT)
+    psv.set_defaults(func=cmd_tts_server)
+
+    pset = sub.add_parser("setup-voxtral",
+                          help="enable Voxtral neural TTS (venv + model + hooks)")
+    pset.add_argument("--voice", default=None)
+    pset.set_defaults(func=cmd_setup_voxtral)
 
     pl = sub.add_parser("listen", help="speak responses from a spool")
     pl.add_argument("--ssh", metavar="HOST", help="tail the spool on a remote host")

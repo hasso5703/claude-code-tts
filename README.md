@@ -1,149 +1,105 @@
 # claude-code-tts 🔊
 
-**Listen to [Claude Code](https://www.claude.com/product/claude-code)'s replies instead of reading them.**
+**Listen to [Claude Code](https://www.claude.com/product/claude-code)'s replies instead of reading them — spoken live, block by block, as Claude writes them.**
 
-A tiny, dependency-free tool that hooks Claude Code's `Stop` event, extracts the
-final text of each response, cleans the Markdown, and **speaks it out loud** —
-on your laptop directly, or on your laptop while Claude Code runs on a remote
-server over SSH.
+Two engines:
 
-- ✅ **Single file**, Python 3 standard library only — nothing to `pip install`.
-- ✅ **macOS & Linux.** macOS uses the built-in `say`; Linux uses `espeak-ng`,
-  `spd-say`, `festival`, or `piper`.
-- ✅ **Two topologies** out of the box: *local* (Claude runs where you listen) and
-  *remote* (Claude runs on a server, you listen on your machine).
-- ✅ **Safe installer**: merges into your `~/.claude/settings.json` without
-  clobbering existing settings or hooks; fully reversible.
-- ✅ **Barge-in**: a new answer interrupts the one still being read.
+- **`say` / espeak / piper** — zero-dependency, instant, built into the OS.
+- **`voxtral`** — a real neural multilingual voice ([Mistral's Voxtral‑4B‑TTS](https://huggingface.co/mistralai/Voxtral-4B-TTS-2603)) running **fully locally** on Apple Silicon via [mlx-audio](https://github.com/Blaizzy/mlx-audio). Natural **French** *and* English (and 7 more languages).
+
+Highlights:
+
+- ✅ **Live streaming.** A background daemon tails the conversation transcript and speaks each block the instant Claude writes it — no waiting for the turn to end, no lag.
+- ✅ **Barge-in.** Start typing and the current speech stops immediately.
+- ✅ **Sequential, gap-aware playback.** Blocks are split into sentences and the next is synthesized while the current one plays.
+- ✅ **Safe, reversible installer.** Merges into `~/.claude/settings.json` (with a `.bak`); never clobbers your other hooks.
+- ✅ **Core is single-file, stdlib-only.** The neural engine is an *optional* upgrade isolated in its own venv — the hook that Claude Code runs never imports anything heavy.
+
+---
+
+## Quick start
+
+```bash
+git clone https://github.com/hasso5703/claude-code-tts.git
+cd claude-code-tts
+
+# Basic: instant OS voice (macOS `say`, Linux espeak/piper)
+./install.sh
+
+# — or — neural French/English voice (macOS Apple Silicon):
+python3 claude_tts.py setup-voxtral        # creates a venv, installs mlx-audio,
+                                            # downloads the model (~2.5 GB), wires hooks
+```
+
+Then **restart Claude Code** (hooks load at startup) — or open `/hooks` inside it. Talk to Claude → hear the reply.
+
+> `doctor` shows everything: `python3 claude_tts.py doctor`
+
+---
+
+## The neural voice (Voxtral)
+
+`setup-voxtral` (or `install --engine voxtral`) does the whole bootstrap and is idempotent:
+
+1. checks you're on **macOS + Apple Silicon** (MLX requirement; otherwise it falls back to `say`),
+2. creates a venv at `~/.claude/tts/venv` and installs `mlx-audio` + `mistral-common[audio]`,
+3. downloads `mlx-community/Voxtral-4B-TTS-2603-mlx-4bit` (~2.5 GB, cached by Hugging Face),
+4. sets `engine=voxtral`, `voice=fr_female`, wires the hooks, and starts the model server.
+
+**How it runs.** A small persistent HTTP server (`tts-server`, in the venv) loads the model **once** and synthesizes on demand on `127.0.0.1:8765`. The stdlib-only hook/daemon talk to it over the loopback, get a WAV back, and play it with `afplay`. The server self-exits after 30 min idle and auto-restarts on demand.
+
+**Voices** (set `voice` in the config): French `fr_female` / `fr_male`; generic/English `casual_female`, `casual_male`, `neutral_female`, `neutral_male`, `cheerful_female`; and per-language `de_*`, `es_*`, `it_*`, `pt_*`, `nl_*`, `ar_male`, `hi_*`. Voxtral is multilingual — the voice carries the timbre/accent, the text carries the language.
+
+**License caveat.** Voxtral weights are **CC‑BY‑NC‑4.0 (non-commercial)**. Fine for personal use; not for a commercial product. For a permissive (Apache‑2.0) alternative, point `voxtral_model` at a Qwen3‑TTS MLX model instead — the server is model-agnostic (it uses mlx-audio's generic loader).
+
+### ⚠️ Performance note (read this)
+
+Voxtral‑4B is a 4‑billion‑parameter model. On Macs **with a fan** (M‑series Pro/Max) it generates **faster than real-time** and streaming is seamless. On the **fanless MacBook Air**, a cold/bursty response is fine (~1× real-time), but a **long, continuous** response heats the chip and it thermally throttles (2–5× real-time) → audible gaps. If that bothers you on an Air, switch `voxtral_model` to a lighter model (e.g. a Qwen3‑TTS `0.6B`/`1.7B`) or use `engine=say`. The plumbing is identical; only the model changes.
 
 ---
 
 ## How it works
 
-Claude Code fires a `Stop` hook every time it finishes a response. The hook reads
-the conversation transcript, pulls out the **final answer text**, strips code
-blocks / links / emoji / Markdown, and writes one line to a *spool* file. From
-there the text is spoken.
-
 ```
-                          ┌──────────────────────────────────────────┐
-   you talk to Claude ──► │ Claude Code  ──(Stop event)──►  hook      │
-                          │                                  │ extract │
-                          │                                  │ clean   │
-                          │                                  ▼         │
-                          │                       ~/.claude/tts/spool  │
-                          └──────────────────────────────────┬────────┘
-                                                              │
-          LOCAL mode: the hook speaks here ◄──────────────────┤
-                                                              │
-          REMOTE mode: `claude-tts listen --ssh host` ◄───────┘  (on your laptop)
-                       tails the spool over SSH and speaks locally
+ you talk to Claude ─► Claude Code writes each block to the transcript (*.jsonl)
+                                         │
+        UserPromptSubmit hook ──► starts a background daemon for the session
+                                         │
+            daemon tails the transcript ─┤ each new assistant block →
+                                         │   split into sentences → queue
+                                         ▼
+                              sequential drainer plays them in order
+                       (engine=say: OS voice │ engine=voxtral: local model server)
 ```
 
----
+- `UserPromptSubmit` starts the daemon and cuts off the previous turn (barge-in).
+- `PreToolUse` keeps the daemon (and the model server) warm.
+- `SessionEnd` stops the daemon.
 
-## Requirements
-
-- **Python 3.8+** (already present on macOS and virtually every Linux).
-- **A TTS engine**:
-  - **macOS** — `say` is built in. ✅ nothing to do.
-  - **Linux** — install one: `sudo apt install espeak-ng` (simplest), or
-    `speech-dispatcher` (`spd-say`), or [`piper`](https://github.com/rhasspy/piper)
-    for neural voices.
-- For **remote mode**: passwordless SSH from your laptop to the server
-  (an SSH key / agent — see [Remote setup](#scenario-b--claude-code-on-a-remote-server)).
-
----
-
-## Install
-
-```bash
-git clone https://github.com/<you>/claude-code-tts.git
-cd claude-code-tts
-./install.sh                 # or: python3 claude_tts.py install
-```
-
-Then **restart Claude Code** (hooks are loaded at startup) — or open the `/hooks`
-menu inside Claude Code to activate it.
-
-That's it for the common case (Claude Code on your laptop). Talk to Claude → hear
-the reply.
-
-> The installer copies `claude_tts.py` to `~/.claude/tts/`, writes a config at
-> `~/.claude/tts/config.json`, and adds a `Stop` hook to `~/.claude/settings.json`
-> (a `.bak` backup is made first).
-
----
-
-## Scenarios
-
-### Scenario A — Claude Code on your laptop (local mode)
-
-This is the default. Install, restart Claude Code, done. Each response is spoken
-on your machine. Pick a voice if you like:
-
-```bash
-# macOS — list French voices, then set one
-say -v '?' | grep fr_FR
-python3 claude_tts.py install --mode local --voice Thomas --rate 210
-
-# Linux (espeak-ng)
-python3 claude_tts.py install --mode local --engine espeak-ng --voice fr
-```
-
-### Scenario B — Claude Code on a remote server (over SSH)
-
-Claude Code runs on a server (no usable audio there); you want to hear it on your
-laptop.
-
-**On the server** — record only, don't try to play audio:
-```bash
-git clone https://github.com/<you>/claude-code-tts.git && cd claude-code-tts
-python3 claude_tts.py install --mode spool
-# restart Claude Code on the server
-```
-
-**On your laptop** — listen and speak:
-```bash
-git clone https://github.com/<you>/claude-code-tts.git && cd claude-code-tts
-python3 claude_tts.py listen --ssh my-server      # uses your ~/.ssh/config host
-```
-Leave that running. Now talk to Claude on the server → your laptop reads the
-replies. It auto-reconnects if the SSH link drops.
-
-**Passwordless SSH** (so `listen` doesn't prompt). On macOS:
-```bash
-ssh-add --apple-use-keychain ~/.ssh/id_ed25519
-```
-and in `~/.ssh/config`:
-```
-Host my-server
-  AddKeysToAgent yes
-  UseKeychain yes
-  IdentityFile ~/.ssh/id_ed25519
-```
-
-> Custom remote spool path? `claude-tts listen --ssh my-server --spool '~/.claude/tts/spool.ndjson'`
+Set `stream=false` to fall back to the classic behaviour: speak only the final answer, once, on the `Stop` hook.
 
 ---
 
 ## Configuration
 
-`~/.claude/tts/config.json`:
+`~/.claude/tts/config.json` (or pass flags at install / `setup-voxtral`):
 
-| Key           | Default   | Meaning |
-|---------------|-----------|---------|
-| `mode`        | `local`   | `local` = the hook speaks here. `spool` = only record (remote box). |
-| `engine`      | `auto`    | `auto`, `say`, `espeak-ng`, `spd-say`, `festival`, `piper`. |
-| `voice`       | `""`      | Engine-specific voice (e.g. `Thomas` for `say`, `fr` for `espeak-ng`). |
-| `rate`        | `null`    | Engine-specific speed (wpm for `say`/`espeak-ng`; -100..100 for `spd-say`). |
-| `barge_in`    | `true`    | A new response interrupts the current one. |
-| `max_chars`   | `0`       | Truncate spoken text to N characters (0 = no limit). |
-| `piper_model` | `""`      | Path to a piper `.onnx` voice (when `engine=piper`). |
+| Key              | Default                                   | Meaning |
+|------------------|-------------------------------------------|---------|
+| `mode`           | `local`                                   | `local` = speak here. `spool` = only record (for a remote listener). |
+| `engine`         | `auto`                                    | `auto`, `say`, `espeak-ng`, `spd-say`, `festival`, `piper`, **`voxtral`**. |
+| `voice`          | `""` (`fr_female` for voxtral)            | Engine-specific voice. |
+| `stream`         | `true`                                    | Speak each block live (daemon). `false` = one shot at end of turn. |
+| `barge_in`       | `true`                                    | A new turn interrupts the current speech. |
+| `rate`           | `null`                                    | Speed for `say`/`espeak-ng` (wpm) / `spd-say` (−100..100). |
+| `max_chars`      | `0`                                       | Truncate spoken text (0 = no limit). |
+| `piper_model`    | `""`                                      | Path to a piper `.onnx` voice (engine=piper). |
+| `voxtral_model`  | `mlx-community/Voxtral-4B-TTS-2603-mlx-4bit` | Any mlx-audio TTS model id. |
+| `voxtral_port`   | `8765`                                    | Local model-server port. |
+| `voxtral_python` | `""`                                      | Python with mlx-audio (`""` = the bundled venv). |
+| `say_voice`      | `""`                                      | `say` voice used if the neural server is ever unavailable (auto-picks a French voice). |
 
-Set values at install time (`--mode`, `--engine`, `--voice`, `--rate`,
-`--piper-model`) or edit the JSON directly. Quick env overrides for one run:
-`CLAUDE_TTS_VOICE`, `CLAUDE_TTS_RATE`, `CLAUDE_TTS_ENGINE`, `CLAUDE_TTS_MODE`.
+Env overrides for one run: `CLAUDE_TTS_ENGINE`, `CLAUDE_TTS_VOICE`, `CLAUDE_TTS_RATE`, `CLAUDE_TTS_MODE`.
 
 ---
 
@@ -151,80 +107,55 @@ Set values at install time (`--mode`, `--engine`, `--voice`, `--rate`,
 
 ```text
 claude-tts install [--mode local|spool] [--engine E] [--voice V] [--rate N] [--piper-model PATH]
-claude-tts uninstall [--purge]          # remove the hook (--purge also deletes config/spool)
-claude-tts listen [--ssh HOST] [--spool PATH]
-claude-tts say "some text"              # test your engine (also reads stdin)
-claude-tts doctor                       # diagnostics: OS, engines, config, hook status
+claude-tts setup-voxtral [--voice fr_female]   # bootstrap + enable the neural voice
+claude-tts uninstall [--purge]                 # remove hooks (--purge also deletes config/venv/cache)
+claude-tts say "some text"                     # test the current engine (also reads stdin)
+claude-tts doctor                              # diagnostics: engines, config, hooks, server, daemons
+claude-tts listen [--ssh HOST] [--spool PATH]  # remote mode: tail+speak a server's spool
 ```
 
-(Run them as `python3 claude_tts.py <cmd>`, or symlink `claude_tts.py` onto your PATH as `claude-tts`.)
-
-Start with **`claude-tts doctor`** if anything misbehaves.
+Run as `python3 claude_tts.py <cmd>` (or symlink `claude_tts.py` onto your PATH as `claude-tts`).
+Start with **`doctor`** if anything misbehaves.
 
 ---
 
-## Neural voices with Piper (optional, Linux/local)
+## Remote mode (Claude Code on a server, you listen on your laptop)
 
-For higher-quality voices than `espeak-ng`, download a [Piper](https://github.com/rhasspy/piper)
-voice (`.onnx` + `.onnx.json`) and:
-```bash
-python3 claude_tts.py install --mode local --engine piper \
-  --piper-model ~/piper/fr_FR-siwis-medium.onnx
-```
-Piper streams raw audio to `aplay`/`paplay`/`ffplay` (auto-detected).
+**On the server** — record only: `python3 claude_tts.py install --mode spool`, restart Claude Code.
+**On your laptop** — listen: `python3 claude_tts.py listen --ssh my-server` (uses your `~/.ssh/config` host; auto-reconnects). Needs passwordless SSH.
+
+> On macOS: `ssh-add --apple-use-keychain ~/.ssh/id_ed25519` and an `~/.ssh/config` entry with `AddKeysToAgent yes` / `UseKeychain yes`.
+
+(The neural engine runs on the box that *speaks*; for remote audio use an OS engine on the laptop.)
 
 ---
 
 ## Troubleshooting
 
-- **Nothing is spoken** → did you restart Claude Code after install? Check with
-  `claude-tts doctor` (`hook wired: YES`). On the server, watch the spool while
-  you talk: `tail -f ~/.claude/tts/spool.ndjson`.
-- **No engine found** → install one (`sudo apt install espeak-ng`). `say` is
-  macOS-only.
-- **Remote `listen` asks for a password** → set up an SSH key / agent (see above).
-- **English voice instead of French** → set `--voice` (e.g. `Thomas` on macOS,
-  `fr` on espeak-ng).
-- **Too verbose / reads progress chatter** → it speaks only the *final* text block
-  of a turn by design; if a turn ends on a tool call it falls back to the last
-  text block (never the whole turn).
+- **Nothing spoken** → restart Claude Code after install; check `doctor` (`hooks wired`, `daemon(s)`, and for voxtral `server UP`).
+- **Robotic voice on French** → that's the `say` fallback; it means the neural server wasn't ready. Check `doctor` → `voxtral … server`; `tail ~/.claude/tts/server.log`.
+- **Voxtral setup skipped** → you're not on Apple Silicon, or `python3 -m venv` failed / Python is too old (need 3.10+). It falls back to `say`.
+- **Gaps on long responses (fanless Air)** → see the performance note above.
+- **Reset the server** → `pkill -f "claude_tts.py tts-server"` (it auto-restarts on the next block).
 
 ---
+
+## Privacy
+
+Everything stays on your machine — local files, local synthesis, no network calls (beyond the one-time model download and your own SSH in remote mode).
 
 ## Uninstall
 
 ```bash
-python3 claude_tts.py uninstall           # remove the hook only
-python3 claude_tts.py uninstall --purge   # also delete config + spool + the copied script
+python3 claude_tts.py uninstall           # remove hooks
+python3 claude_tts.py uninstall --purge   # also delete config, queue, venv, server state
 ```
-Then restart Claude Code.
-
----
-
-## Under the hood
-
-- **Hook**: `~/.claude/settings.json` → `hooks.Stop` runs
-  `python3 ~/.claude/tts/claude_tts.py hook`. The hook receives the Stop event
-  JSON on stdin (`transcript_path`, `session_id`, …), never blocks Claude, and
-  always exits 0.
-- **Extraction**: walks the transcript (`*.jsonl`) from the end and takes the
-  final run of assistant `text` blocks (skipping `thinking`/`tool_use`).
-- **Spool**: `~/.claude/tts/spool.ndjson`, one JSON object per response
-  (`{ts, session, cwd, chars, text, raw}`), plus `last.txt` / `last.raw.txt` /
-  `last.json` for convenience. Any external script can consume these.
-- **De-dupe**: identical consecutive responses are skipped (hash check).
-
-## Privacy
-
-Everything stays on your machines — the hook writes local files and the audio is
-synthesized locally (or on the box you SSH to). No data leaves your devices, no
-network calls (except your own SSH connection in remote mode).
+Then restart Claude Code. (The Hugging Face model cache in `~/.cache/huggingface` is left alone.)
 
 ## Contributing
 
-Issues and pull requests welcome. Windows support (PowerShell `System.Speech`)
-is a good first contribution. Keep it **standard-library only**.
+Issues and PRs welcome — keep the **hook path standard-library only** (heavy deps belong in the venv). Windows support is a good first contribution.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE). (The optional Voxtral *model weights* are CC‑BY‑NC‑4.0, owned by Mistral AI; this tool just calls them.)
